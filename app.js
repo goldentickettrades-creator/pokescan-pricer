@@ -2,38 +2,47 @@
 
 const API = 'https://api.tcgdex.net/v2/en';
 const CLAUDE_MODEL = 'claude-opus-5-5';
+const EUR_TO_USD = 1.08; // only used to sort and filter, never shown as a converted price
 const $ = (s) => document.querySelector(s);
 
 const els = {
-  video: $('#video'), still: $('#still'), guide: $('#guide'), viewfinder: $('#viewfinder'), vfEmpty: $('#vfEmpty'),
-  startCam: $('#startCam'), scanBtn: $('#scanBtn'), fileInput: $('#fileInput'), camSelect: $('#camSelect'),
-  statusLine: $('#statusLine'), bar: $('#bar'), barFill: $('#barFill'),
-  searchForm: $('#searchForm'), searchInput: $('#searchInput'),
-  emptySlip: $('#emptySlip'), slipWrap: $('#slipWrap'), alts: $('#alts'),
-  binder: $('#binder'), binderBody: $('#binderBody'), ledgerEmpty: $('#ledgerEmpty'), ledgerTools: $('#ledgerTools'),
-  ledgerTotal: $('#ledgerTotal'), ledgerCount: $('#ledgerCount'),
-  refreshAll: $('#refreshAll'), exportCsv: $('#exportCsv'), clearAll: $('#clearAll'),
-  confirmClear: $('#confirmClear'), confirmClearYes: $('#confirmClearYes'), confirmClearNo: $('#confirmClearNo'),
-  settings: $('#settings'), settingsBtn: $('#settingsBtn'), apiKey: $('#apiKey'), modePill: $('#modePill'), modeText: $('#modeText'),
+  app: $('#app'), stage: $('#stage'), video: $('#video'), still: $('#still'), guide: $('#guide'),
+  stageEmpty: $('#stageEmpty'), demoBtn: $('#demoBtn'),
+  statusPill: $('#statusPill'), statusText: $('#statusText'), helpBtn: $('#helpBtn'),
+  sheet: $('#sheet'), sheetBody: $('#sheetBody'),
+  strip: $('#strip'), stripMain: $('#stripMain'), stripLabel: $('#stripLabel'), stripTotal: $('#stripTotal'), undoBtn: $('#undoBtn'),
+  dockReady: $('#dockReady'), dockResult: $('#dockResult'), scanBtn: $('#scanBtn'), searchBtn: $('#searchBtn'),
+  skipBtn: $('#skipBtn'), addBtn: $('#addBtn'), fileInput: $('#fileInput'),
+  chooser: $('#chooser'), chooserList: $('#chooserList'), chooserNote: $('#chooserNote'),
+  searchPanel: $('#searchPanel'), searchForm: $('#searchForm'), searchInput: $('#searchInput'), searchList: $('#searchList'), searchNote: $('#searchNote'),
+  binderPanel: $('#binderPanel'), binderBody: $('#binderBody'),
+  lightbox: $('#lightbox'), lightboxImg: $('#lightboxImg'),
+  settings: $('#settings'), settingsBtn: $('#settingsBtn'), apiKey: $('#apiKey'), soundOpt: $('#soundOpt'),
 };
 
 const state = {
   stream: null,
   busy: false,
-  card: null,          // full TCGdex card
-  variant: null,       // selected tcgplayer variant key
+  saving: false,
+  card: null,            // full TCGdex card on the sheet
+  printing: null,        // chosen printing key, or null when the person still has to choose
   candidates: [],
-  confidence: null,    // 'strong' | 'guess' | 'example' | 'picked'
+  confidence: null,      // 'strong' | 'guess' | 'picked' | 'demo'
+  detailsOpen: false,
   collection: loadCollection(),
+  lastAdd: null,
+  undoTimer: null,
+  scans: storageGet('pokescan.scans', 0),
 };
 
-/* ---------- small helpers ---------- */
+/* ---------- helpers ---------- */
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-const usd = (n) => (n == null || isNaN(n) ? '—' : '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
-const eur = (n) => (n == null || isNaN(n) ? '—' : '€' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const usd = (n) => (n == null || isNaN(n) ? '—' : '$' + fmt(n));
+const eur = (n) => (n == null || isNaN(n) ? '—' : '€' + fmt(n));
 
 function storageGet(k, fallback) {
   try { const v = localStorage.getItem(k); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
@@ -41,21 +50,30 @@ function storageGet(k, fallback) {
 function storageSet(k, v) {
   try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage unavailable */ }
 }
-function loadCollection() { return storageGet('pokescan.collection', []); }
+function loadCollection() {
+  const col = storageGet('pokescan.collection', []);
+  // Earlier versions stored the printing as `variant`.
+  for (const e of col) if (e.printing === undefined && e.variant !== undefined) { e.printing = e.variant; delete e.variant; }
+  return col;
+}
 function saveCollection() { storageSet('pokescan.collection', state.collection); }
-function apiKey() { return storageGet('pokescan.apiKey', ''); }
+const apiKey = () => storageGet('pokescan.apiKey', '');
+const source = () => storageGet('pokescan.source', 'tcg'); // 'tcg' | 'cm'
+const soundOn = () => storageGet('pokescan.sound', false);
 
 async function getJSON(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`Card database returned ${r.status}`);
+  if (!r.ok) throw new Error(`The card database returned an error (${r.status}). Try again in a moment.`);
   return r.json();
 }
 
-function setStatus(msg, { error = false, busy = false, progress = null } = {}) {
-  els.statusLine.className = 'status-line' + (error ? ' error' : '');
-  els.statusLine.innerHTML = (busy ? '<span class="spin"></span>' : '') + `<span>${esc(msg)}</span>`;
-  els.bar.hidden = progress == null;
-  if (progress != null) els.barFill.style.width = Math.round(progress * 100) + '%';
+function setStatus(msg, { busy = false, error = false } = {}) {
+  els.statusPill.hidden = !msg;
+  els.statusPill.classList.toggle('error', error);
+  els.statusPill.innerHTML = (busy ? '<span class="spin"></span>' : '') + `<span>${esc(msg)}</span>`;
+}
+function idleStatus() {
+  setStatus(state.stream ? 'Fit the whole card inside the frame.' : '');
 }
 
 const imgUrl = (base, q = 'high') => (base ? `${base}/${q}.webp` : '');
@@ -70,34 +88,54 @@ function getSets() {
   return setsPromise;
 }
 
+function haptic() { try { navigator.vibrate?.(14); } catch { /* unsupported */ } }
+
+let audioCtx = null;
+function chime() {
+  if (!soundOn()) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const t = audioCtx.currentTime;
+    [880, 1320].forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, t + i * 0.07);
+      g.gain.exponentialRampToValueAtTime(0.12, t + i * 0.07 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.07 + 0.16);
+      o.connect(g).connect(audioCtx.destination);
+      o.start(t + i * 0.07); o.stop(t + i * 0.07 + 0.18);
+    });
+  } catch { /* audio unavailable */ }
+}
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 /* ---------- camera ---------- */
 
-async function startCamera(deviceId) {
+async function startCamera() {
   stopCamera();
   if (!navigator.mediaDevices?.getUserMedia) {
-    setStatus('This browser cannot use the camera here. Use Upload photo instead.', { error: true });
+    setStatus('This browser cannot open the camera here. Use Upload instead.', { error: true });
     return;
   }
-  const video = deviceId
-    ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-    : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } };
   try {
-    state.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false,
+    });
     els.video.srcObject = state.stream;
     await els.video.play();
-    els.vfEmpty.hidden = true;
+    els.stageEmpty.hidden = true;
     els.still.hidden = true;
     els.video.hidden = false;
     els.guide.hidden = false;
-    els.scanBtn.disabled = false;
-    setStatus('Camera on. Fill the frame with the card, then press Scan card (or Space).');
-    await listCameras();
+    storageSet('pokescan.camOk', true);
+    // Show the name/number zones for the first couple of scans, then keep the frame calm.
+    setHelp(state.scans < 2);
+    idleStatus();
   } catch (e) {
     const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
-    setStatus(denied
-      ? 'Camera permission was blocked. Allow it in the address bar, or use Upload photo.'
-      : 'No camera found. Use Upload photo, or type the card name below.', { error: true });
+    setStatus(denied ? 'Camera blocked. Allow it in your browser settings, or use Upload.' : 'No camera found. Use Upload or Search.', { error: true });
   }
+  renderDock();
 }
 
 function stopCamera() {
@@ -105,21 +143,15 @@ function stopCamera() {
   state.stream = null;
 }
 
-async function listCameras() {
-  try {
-    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
-    if (devices.length < 2) { els.camSelect.hidden = true; return; }
-    const current = state.stream?.getVideoTracks()[0]?.getSettings().deviceId;
-    els.camSelect.innerHTML = devices.map((d, i) =>
-      `<option value="${esc(d.deviceId)}"${d.deviceId === current ? ' selected' : ''}>${esc(d.label || 'Camera ' + (i + 1))}</option>`).join('');
-    els.camSelect.hidden = false;
-  } catch { els.camSelect.hidden = true; }
+function setHelp(on) {
+  els.guide.classList.toggle('help', on);
+  els.helpBtn.setAttribute('aria-pressed', String(on));
 }
 
 /** Crop the area inside the on-screen card guide out of the live video frame. */
 function grabFrame() {
   const v = els.video, vw = v.videoWidth, vh = v.videoHeight;
-  const box = els.viewfinder.getBoundingClientRect();
+  const box = els.stage.getBoundingClientRect();
   const g = els.guide.getBoundingClientRect();
   const scale = Math.max(box.width / vw, box.height / vh); // object-fit: cover
   const ox = (box.width - vw * scale) / 2, oy = (box.height - vh * scale) / 2;
@@ -138,12 +170,9 @@ function grabFrame() {
 /* ---------- OCR (on-device, Tesseract) ---------- */
 
 let workerPromise = null;
-let ocrProgressCb = null;
 function getWorker() {
   if (!workerPromise) {
-    workerPromise = Tesseract.createWorker('eng', 1, {
-      logger: (m) => { if (m.status === 'recognizing text' && ocrProgressCb) ocrProgressCb(m.progress); },
-    }).catch((e) => { workerPromise = null; throw e; });
+    workerPromise = Tesseract.createWorker('eng', 1).catch((e) => { workerPromise = null; throw e; });
   }
   return workerPromise;
 }
@@ -162,19 +191,15 @@ function band(src, y0, y1, x0 = 0, x1 = 1, targetW = 1600) {
 
 async function ocrCard(canvas) {
   const worker = await getWorker();
-  const passes = [
+  const out = {};
+  for (const [key, img] of [
     ['top', band(canvas, 0, 0.14, 0, 0.78)],
     ['bottom', band(canvas, 0.84, 1, 0, 1)],
     ['full', band(canvas, 0, 1, 0, 1, 1200)],
-  ];
-  const out = {};
-  for (let i = 0; i < passes.length; i++) {
-    const [key, img] = passes[i];
-    ocrProgressCb = (p) => setStatus('Reading the card…', { busy: true, progress: (i + p) / passes.length });
+  ]) {
     const { data } = await worker.recognize(img);
     out[key] = data.text || '';
   }
-  ocrProgressCb = null;
   return out;
 }
 
@@ -207,14 +232,11 @@ function jpegB64(canvas, maxSide = 1400) {
 }
 
 async function claudeIdentify(canvas) {
-  const key = apiKey();
-  const data = jpegB64(canvas);
-  const schema = CARD_SCHEMA;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': key,
+      'x-api-key': apiKey(),
       'anthropic-version': '2023-06-01',
       'anthropic-dangerous-direct-browser-access': 'true',
       'anthropic-beta': 'server-side-fallback-2026-07-01',
@@ -222,12 +244,12 @@ async function claudeIdentify(canvas) {
     body: JSON.stringify({
       model: CLAUDE_MODEL,
       max_tokens: 4000,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema } },
+      output_config: { effort: 'low', format: { type: 'json_schema', schema: CARD_SCHEMA } },
       fallbacks: 'default',
       messages: [{
         role: 'user',
         content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } },
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpegB64(canvas) } },
           { type: 'text', text: CARD_PROMPT },
         ],
       }],
@@ -367,26 +389,64 @@ function confidenceOf(cands) {
   return a.score >= 9 && (!b || a.score - b.score >= 1.5) ? 'strong' : 'guess';
 }
 
+/* ---------- pricing ---------- */
+
+const PRINTING_ORDER = ['normal', 'holofoil', 'reverse-holofoil', '1st-edition-holofoil', '1st-edition-normal', 'unlimited-holofoil', 'unlimited'];
+const printingLabel = (k) => ({
+  normal: 'Normal', holofoil: 'Holo', 'reverse-holofoil': 'Reverse Holo',
+  '1st-edition-holofoil': '1st Ed. Holo', '1st-edition-normal': '1st Edition', 'unlimited-holofoil': 'Unlimited Holo', unlimited: 'Unlimited',
+}[k] || k.split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '));
+
+/** Printings this card actually exists in: TCGplayer's price keys, or the card's variant flags as a fallback. */
+function printingsOf(card) {
+  const tp = card.pricing?.tcgplayer;
+  let keys = tp ? Object.keys(tp).filter((k) => tp[k] && typeof tp[k] === 'object') : [];
+  if (!keys.length && card.variants) {
+    const v = card.variants;
+    if (v.normal) keys.push('normal');
+    if (v.holo) keys.push('holofoil');
+    if (v.reverse) keys.push('reverse-holofoil');
+    if (v.firstEdition) keys.push('1st-edition-holofoil');
+  }
+  return keys.sort((a, b) => {
+    const ia = PRINTING_ORDER.indexOf(a), ib = PRINTING_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+}
+
+/** Both marketplace values for one printing. Cardmarket's "-holo" columns are its reverse-holo prices. */
+function valuesFor(card, printing) {
+  const tp = card.pricing?.tcgplayer;
+  const cm = card.pricing?.cardmarket;
+  const v = tp && printing ? tp[printing] : null;
+  const rev = printing === 'reverse-holofoil';
+  return {
+    usd: v ? (v.marketPrice ?? v.midPrice ?? null) : null,
+    eur: cm ? ((rev ? cm['trend-holo'] : cm.trend) ?? (rev ? cm['avg-holo'] : cm.avg) ?? null) : null,
+  };
+}
+
 /* ---------- scan flow ---------- */
 
 async function identify(canvas) {
   if (state.busy) return;
   state.busy = true;
-  els.scanBtn.disabled = true;
+  renderDock();
+  els.guide.classList.add('captured');
   try {
     let hints = null;
     if (apiKey()) {
-      setStatus('Claude is reading the card…', { busy: true });
+      setStatus('Reading card…', { busy: true });
       try {
         const r = await claudeIdentify(canvas);
-        if (!r.is_pokemon_card) { setStatus("That doesn't look like a Pokémon card. Try again with the card filling the frame.", { error: true }); return; }
+        if (!r.is_pokemon_card) { setStatus("That doesn't look like a Pokémon card. Try again.", { error: true }); return; }
         hints = { exactNames: r.name ? [r.name] : [], names: nameTokens(r.name), num: parseNumber(r.number), text: r.name, setName: r.set_name };
       } catch (e) {
-        setStatus(`${e.message} Falling back to the on-device reader…`, { error: true });
+        setStatus(`${e.message} Using the on-device reader…`, { busy: true, error: true });
       }
     }
     if (!hints) {
-      setStatus('Reading the card…', { busy: true, progress: 0 });
+      setStatus('Reading card…', { busy: true });
       const t = await ocrCard(canvas);
       hints = {
         names: nameTokens(t.top).concat(nameTokens(t.full).slice(0, 1)),
@@ -394,297 +454,471 @@ async function identify(canvas) {
         text: t.top + ' ' + t.full,
       };
     }
-    setStatus('Looking up the card…', { busy: true });
+    setStatus('Finding match…', { busy: true });
     const cands = await findCandidates(hints);
     if (!cands.length) {
       const seen = [hints.exactNames?.[0] || hints.names?.[0], hints.num && `${hints.num.prefix}${hints.num.n}${hints.num.total ? '/' + hints.num.total : ''}`].filter(Boolean).join(', ');
-      setStatus(`Couldn't match that card${seen ? ` (read: ${seen})` : ''}. Hold it closer with less glare, or type the name and number below.`, { error: true });
+      setStatus(`No match${seen ? ` for "${seen}"` : ''}. Move closer, cut the glare, or use Search.`, { error: true });
       return;
     }
+    state.scans += 1; storageSet('pokescan.scans', state.scans);
+    if (state.scans >= 2) setHelp(false);
     state.candidates = cands;
     state.confidence = confidenceOf(cands);
-    await showCard(cands[0].id);
-    setStatus(state.confidence === 'strong' ? 'Matched. Scan the next card whenever you are ready.' : 'Best guess shown. If it is wrong, pick the right one under Other matches.');
+    setStatus('Getting prices…', { busy: true });
+    await openCard(cands[0].id);
+    idleStatus();
+    if (state.confidence === 'guess') openChooser(true);
   } catch (e) {
-    setStatus(e.message || 'Something went wrong while scanning. Try again.', { error: true });
+    setStatus(e.message || 'Something went wrong. Try again.', { error: true });
   } finally {
     state.busy = false;
-    els.scanBtn.disabled = !state.stream;
+    els.guide.classList.remove('captured');
+    renderDock();
   }
 }
 
-function scanFromCamera() {
-  if (!state.stream || state.busy || !els.video.videoWidth) return;
-  els.guide.classList.remove('flash'); void els.guide.offsetWidth; els.guide.classList.add('flash');
+function onScan() {
+  if (!state.stream) { startCamera(); return; }
+  if (state.busy || !els.video.videoWidth) return;
   identify(grabFrame());
 }
 
-function scanFromFile(file) {
+function scanFile(file) {
   if (!file) return;
   const url = URL.createObjectURL(file);
   const img = new Image();
   img.onload = () => {
     stopCamera();
     els.video.hidden = true;
-    els.vfEmpty.hidden = true;
+    els.stageEmpty.hidden = true;
     els.guide.hidden = true;
     els.still.src = url;
     els.still.hidden = false;
-    els.scanBtn.disabled = true;
     const c = document.createElement('canvas');
     const k = Math.min(1, 2000 / Math.max(img.width, img.height));
     c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    identify(c).finally(() => {
-      els.vfEmpty.hidden = false;
-      els.vfEmpty.querySelector('p').textContent = 'Photo checked. Start the camera to scan live, or upload another photo.';
-    });
+    identify(c);
   };
   img.onerror = () => setStatus("That file couldn't be opened as an image.", { error: true });
   img.src = url;
 }
 
-async function manualSearch(q) {
-  q = q.trim();
-  if (!q || state.busy) return;
-  state.busy = true;
-  setStatus('Searching…', { busy: true });
-  try {
-    const num = parseNumber(q) || (q.match(/\b\d{1,3}\b/) ? { prefix: '', n: parseInt(q.match(/\b(\d{1,3})\b/)[1], 10), total: null } : null);
-    const namePart = q.replace(/[A-Z]{0,4}\d{1,3}\s*\/\s*[A-Z]{0,4}\d{1,3}/gi, ' ').replace(/\b\d{1,3}\b/g, ' ').replace(/#/g, ' ').trim();
-    const hints = { exactNames: namePart ? [namePart] : [], names: nameTokens(namePart), num, text: namePart };
-    const cands = await findCandidates(hints);
-    if (!cands.length) { setStatus(`No cards found for "${q}". Check the spelling, or try just the name.`, { error: true }); return; }
-    state.candidates = cands;
-    state.confidence = confidenceOf(cands);
-    await showCard(cands[0].id);
-    setStatus(`${cands.length} match${cands.length === 1 ? '' : 'es'} for "${q}".`);
-  } catch (e) {
-    setStatus(e.message || 'Search failed. Try again.', { error: true });
-  } finally {
-    state.busy = false;
+/** After a result is dismissed, go back to whatever the person was scanning with. */
+function backToCamera() {
+  closeSheet();
+  if (!state.stream) {
+    els.still.hidden = true;
+    if (storageGet('pokescan.camOk', false)) startCamera();
+    else { els.stageEmpty.hidden = false; renderDock(); }
   }
+  idleStatus();
 }
 
-/* ---------- pricing ---------- */
+/* ---------- result sheet ---------- */
 
-const VARIANT_ORDER = ['normal', 'holofoil', 'reverse-holofoil', '1st-edition-holofoil', '1st-edition-normal', 'unlimited-holofoil', 'unlimited'];
-const variantLabel = (k) => k.split('-').map((w) => (w === '1st' ? '1st' : w[0].toUpperCase() + w.slice(1))).join(' ').replace('Holofoil', 'Holo');
+async function openCard(id, { demo = false } = {}) {
+  const card = await getJSON(`${API}/cards/${encodeURIComponent(id)}`);
+  state.card = card;
+  const printings = printingsOf(card);
+  // Only pre-select when there is exactly one printing; never carry the last card's choice over.
+  state.printing = printings.length === 1 ? printings[0] : null;
+  state.detailsOpen = false;
+  if (demo) state.confidence = 'demo';
+  renderSheet();
+  els.sheet.classList.remove('closed');
+  els.sheet.setAttribute('aria-hidden', 'false');
+  renderDock();
+}
 
-function tcgVariants(card) {
-  const tp = card.pricing?.tcgplayer;
-  if (!tp) return [];
-  const keys = Object.keys(tp).filter((k) => tp[k] && typeof tp[k] === 'object');
-  return keys.sort((a, b) => {
-    const ia = VARIANT_ORDER.indexOf(a), ib = VARIANT_ORDER.indexOf(b);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+function closeSheet() {
+  els.sheet.classList.add('closed');
+  els.sheet.setAttribute('aria-hidden', 'true');
+  state.card = null;
+  renderDock();
+}
+
+function numberText(c) {
+  const total = c.set?.cardCount?.official;
+  return total && /^\d+$/.test(c.localId) ? `${c.localId}/${String(total).padStart(String(c.localId).length, '0')}` : c.localId;
+}
+
+const inBinder = (id) => state.collection.some((e) => e.id === id);
+
+function renderSheet() {
+  const c = state.card;
+  if (!c) return;
+  const printings = printingsOf(c);
+  const tp = c.pricing?.tcgplayer, cm = c.pricing?.cardmarket;
+  const updated = tp?.updated || cm?.updated;
+  const updatedText = updated ? new Date(updated).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : null;
+  const src = source();
+
+  const chips = [
+    { strong: '<span class="chip good">Match</span>', guess: '<span class="chip warn">Best guess</span>', picked: '<span class="chip good">Your pick</span>', demo: '<span class="chip info">Demo</span>' }[state.confidence] || '',
+    state.confidence !== 'demo' && !inBinder(c.id) ? '<span class="chip new">New find</span>' : '',
+  ].join('');
+
+  // Headline: the chosen printing's value, or the range across printings while the person still has to choose.
+  let priceHtml;
+  const primaryLabel = src === 'cm' ? 'Cardmarket trend · EUR' : 'TCGplayer market · USD';
+  const altLabel = src === 'cm' ? 'TCGplayer market · USD' : 'Cardmarket trend · EUR';
+  const pick = (vals) => (src === 'cm' ? [vals.eur, vals.usd, eur, usd] : [vals.usd, vals.eur, usd, eur]);
+  if (state.printing || !printings.length) {
+    const vals = valuesFor(c, state.printing);
+    const [main, alt, fmtMain, fmtAlt] = pick(vals);
+    priceHtml = `
+      <span class="price-label">${esc(primaryLabel)}${state.printing ? ' · ' + esc(printingLabel(state.printing)) : ''}</span>
+      ${main != null ? `<span class="price-main">${fmtMain(main)}</span>` : '<span class="price-main none">Price unavailable</span>'}
+      ${alt != null ? `<span class="price-alt">${fmtAlt(alt)}<small>${esc(altLabel)}</small></span>` : ''}`;
+  } else {
+    const mains = printings.map((p) => pick(valuesFor(c, p))[0]).filter((x) => x != null);
+    const fmtMain = src === 'cm' ? eur : usd;
+    const lo = Math.min(...mains), hi = Math.max(...mains);
+    priceHtml = `
+      <span class="price-label">${esc(primaryLabel)} · depends on printing</span>
+      ${mains.length ? `<span class="price-main range">${lo === hi ? fmtMain(lo) : `${fmtMain(lo)} – ${fmtMain(hi)}`}</span>` : '<span class="price-main none">Price unavailable</span>'}`;
+  }
+
+  const v = tp && state.printing ? tp[state.printing] : null;
+  const rev = state.printing === 'reverse-holofoil';
+  const productId = v?.productId || (tp && Object.values(tp).find((x) => x && x.productId)?.productId);
+  const tcgLink = productId ? `https://www.tcgplayer.com/product/${productId}` : `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(c.name + ' ' + (c.set?.name || ''))}`;
+  const ebayLink = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(`${c.name} ${numberText(c)} ${c.set?.name || ''}`.trim())}&LH_Sold=1&LH_Complete=1`;
+  const multiple = state.candidates.length > 1 && state.confidence !== 'demo';
+
+  els.sheetBody.innerHTML = `
+    <div class="ident">
+      <button class="thumb" type="button" id="thumbBtn" aria-label="View the card larger">
+        ${c.image ? `<img src="${esc(imgUrl(c.image, 'low'))}" alt="${esc(c.name)}">` : ''}
+      </button>
+      <div class="ident-meta">
+        <div class="chips">${chips}</div>
+        <h2 class="card-name">${esc(c.name)}</h2>
+        <p class="card-sub">${esc(c.set?.name || 'Unknown set')} · <span class="mono">#${esc(numberText(c))}</span>${c.rarity ? ' · ' + esc(c.rarity) : ''}</p>
+      </div>
+    </div>
+
+    ${printings.length > 1 ? `
+    <div class="printings${state.printing ? '' : ' need'}" role="group" aria-label="Printing">
+      <span class="label">${state.printing ? 'Printing' : 'Choose printing'}</span>
+      ${printings.map((p) => `<button type="button" class="printing" data-p="${esc(p)}" aria-pressed="${p === state.printing}">${esc(printingLabel(p))}</button>`).join('')}
+    </div>` : ''}
+
+    <div class="price">
+      ${priceHtml}
+      <span class="price-note">Near-mint, ungraded${updatedText ? ` · Updated ${esc(updatedText)}` : ''}</span>
+    </div>
+
+    <button class="row-btn" type="button" id="detailsBtn" aria-expanded="${state.detailsOpen}" aria-controls="details">
+      Price details
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="details" id="details" ${state.detailsOpen ? '' : 'hidden'}>
+      <div class="price-table">
+        <h3><span>TCGplayer${state.printing ? ' · ' + esc(printingLabel(state.printing)) : ''}</span><span>USD</span></h3>
+        ${v ? `<dl>
+          <dt>Market</dt><dd>${usd(v.marketPrice)}</dd>
+          <dt>Low</dt><dd>${usd(v.lowPrice)}</dd>
+          <dt>Mid</dt><dd>${usd(v.midPrice)}</dd>
+          <dt>High</dt><dd>${usd(v.highPrice)}</dd>
+        </dl>` : `<p>${state.printing || !tp ? 'No TCGplayer listings.' : 'Choose a printing to see its prices.'}</p>`}
+      </div>
+      <div class="price-table">
+        <h3><span>Cardmarket${rev ? ' · Reverse Holo' : ''}</span><span>EUR</span></h3>
+        ${cm ? `<dl>
+          <dt>Trend</dt><dd>${eur(rev ? cm['trend-holo'] : cm.trend)}</dd>
+          <dt>Low</dt><dd>${eur(rev ? cm['low-holo'] : cm.low)}</dd>
+          <dt>7-day avg</dt><dd>${eur(rev ? cm['avg7-holo'] : cm.avg7)}</dd>
+          <dt>30-day avg</dt><dd>${eur(rev ? cm['avg30-holo'] : cm.avg30)}</dd>
+        </dl>` : '<p>No Cardmarket sales.</p>'}
+      </div>
+      <div class="links">
+        <a class="btn" href="${esc(tcgLink)}" target="_blank" rel="noopener">TCGplayer</a>
+        <a class="btn" href="${esc(ebayLink)}" target="_blank" rel="noopener">eBay sold</a>
+      </div>
+    </div>
+
+    ${multiple ? `<button class="row-btn" type="button" id="wrongBtn">Wrong card? Choose another
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button>` : ''}
+  `;
+
+  els.sheetBody.querySelectorAll('.printing').forEach((b) => b.addEventListener('click', () => { state.printing = b.dataset.p; renderSheet(); renderDock(); }));
+  $('#detailsBtn').addEventListener('click', () => { state.detailsOpen = !state.detailsOpen; renderSheet(); });
+  $('#wrongBtn')?.addEventListener('click', () => openChooser(false));
+  $('#thumbBtn').addEventListener('click', () => {
+    if (!c.image) return;
+    els.lightboxImg.src = imgUrl(c.image, 'high');
+    els.lightboxImg.alt = c.name;
+    els.lightbox.hidden = false;
   });
 }
 
-/** Headline value in USD for a card + variant (falls back to Cardmarket trend converted at a rough rate). */
-function marketValue(card, variant) {
-  const tp = card.pricing?.tcgplayer;
-  const v = tp && variant && tp[variant];
-  if (v && (v.marketPrice ?? v.midPrice) != null) return { usd: v.marketPrice ?? v.midPrice, source: 'TCGplayer market' };
-  const cm = card.pricing?.cardmarket;
-  if (cm) {
-    const holo = variant && /holo/.test(variant);
-    const trend = (holo ? cm['trend-holo'] : null) ?? cm.trend ?? cm.avg;
-    if (trend != null) return { eur: trend, source: 'Cardmarket trend' };
-  }
-  return null;
-}
+/* ---------- dock ---------- */
 
-/* ---------- rendering ---------- */
-
-async function showCard(id) {
-  const card = await getJSON(`${API}/cards/${encodeURIComponent(id)}`);
-  state.card = card;
-  const vars = tcgVariants(card);
-  state.variant = vars[0] || null;
-  renderSlip();
-  renderAlts();
-}
-
-function renderSlip() {
-  const c = state.card;
-  if (!c) return;
-  const vars = tcgVariants(c);
-  const tp = c.pricing?.tcgplayer;
-  const cm = c.pricing?.cardmarket;
-  const v = tp && state.variant ? tp[state.variant] : null;
-  const mv = marketValue(c, state.variant);
-  const total = c.set?.cardCount?.official;
-  const numberText = total && /^\d+$/.test(c.localId) ? `${c.localId}/${String(total).padStart(String(c.localId).length, '0')}` : c.localId;
-  const updated = tp?.updated || cm?.updated;
-  const updatedText = updated ? new Date(updated).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : null;
-  const holo = state.variant && /holo/.test(state.variant);
-
-  const conf = {
-    strong: '<span class="chip good">● Strong match</span>',
-    guess: '<span class="chip warn">● Best guess, check below</span>',
-    example: '<span class="chip info">Example card</span>',
-    picked: '<span class="chip good">● Your pick</span>',
-  }[state.confidence] || '';
-
-  const productId = v?.productId || (tp && Object.values(tp).find((x) => x && x.productId)?.productId);
-  const tcgLink = productId ? `https://www.tcgplayer.com/product/${productId}` : `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(c.name + ' ' + (c.set?.name || ''))}`;
-  const ebayQ = `${c.name} ${numberText} ${c.set?.name || ''}`.trim();
-  const ebayLink = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(ebayQ)}&LH_Sold=1&LH_Complete=1`;
-
-  els.emptySlip.hidden = true;
-  els.slipWrap.hidden = false;
-  els.slipWrap.innerHTML = `
-    <div class="slip">
-      ${c.image ? `<img class="card-img" src="${esc(imgUrl(c.image))}" alt="${esc(c.name)} card" onerror="this.onerror=null;this.src='${esc(imgUrl(c.image, 'low').replace('.webp', '.png'))}'">` : '<div class="card-img" role="img" aria-label="No image available"></div>'}
-      <div class="slip-meta">
-        ${conf}
-        <h2 class="card-title">${esc(c.name)}</h2>
-        <p class="card-sub"><span>${esc(c.set?.name || 'Unknown set')}</span><span class="num">#${esc(numberText)}</span>${c.rarity ? `<span>${esc(c.rarity)}</span>` : ''}</p>
-        <div class="value-block">
-          <span class="value-label">${esc(mv?.source || 'Market value')}${state.variant && mv?.usd != null ? ' · ' + esc(variantLabel(state.variant)) : ''}</span>
-          <span class="value-big">${mv ? (mv.usd != null ? usd(mv.usd) : eur(mv.eur)) : 'No price yet'}</span>
-          <span class="value-note">${mv ? `Near-mint, ungraded${updatedText ? ` · updated ${esc(updatedText)}` : ''}` : 'No recent sales data for this printing.'}</span>
-        </div>
-        ${vars.length > 1 ? `<div class="variants" role="group" aria-label="Printing">${vars.map((k) =>
-          `<button type="button" class="variant-btn" data-variant="${esc(k)}" aria-pressed="${k === state.variant}">${esc(variantLabel(k))} · ${usd(tp[k].marketPrice ?? tp[k].midPrice)}</button>`).join('')}</div>` : ''}
-        <div class="price-grid">
-          <div class="price-table">
-            <h3><span>TCGplayer</span><span>USD</span></h3>
-            ${v ? `<dl>
-              <dt>Market</dt><dd>${usd(v.marketPrice)}</dd>
-              <dt>Low</dt><dd>${usd(v.lowPrice)}</dd>
-              <dt>Mid</dt><dd>${usd(v.midPrice)}</dd>
-              <dt>High</dt><dd>${usd(v.highPrice)}</dd>
-            </dl>` : '<p class="none">No TCGplayer listings.</p>'}
-          </div>
-          <div class="price-table">
-            <h3><span>Cardmarket${holo ? ' · holo' : ''}</span><span>EUR</span></h3>
-            ${cm ? `<dl>
-              <dt>Trend</dt><dd>${eur(holo ? cm['trend-holo'] ?? cm.trend : cm.trend)}</dd>
-              <dt>Low</dt><dd>${eur(holo ? cm['low-holo'] ?? cm.low : cm.low)}</dd>
-              <dt>7-day avg</dt><dd>${eur(holo ? cm['avg7-holo'] ?? cm.avg7 : cm.avg7)}</dd>
-              <dt>30-day avg</dt><dd>${eur(holo ? cm['avg30-holo'] ?? cm.avg30 : cm.avg30)}</dd>
-            </dl>` : '<p class="none">No Cardmarket sales.</p>'}
-          </div>
-        </div>
-        <div class="actions">
-          <button class="btn primary" type="button" id="addBtn">Add to binder</button>
-          <a class="btn" href="${esc(tcgLink)}" target="_blank" rel="noopener">TCGplayer</a>
-          <a class="btn" href="${esc(ebayLink)}" target="_blank" rel="noopener">eBay sold</a>
-        </div>
-      </div>
-    </div>`;
-
-  els.slipWrap.querySelectorAll('.variant-btn').forEach((b) => b.addEventListener('click', () => { state.variant = b.dataset.variant; renderSlip(); }));
-  $('#addBtn').addEventListener('click', addCurrentToBinder);
-}
-
-function renderAlts() {
-  const others = state.candidates;
-  if (!others || others.length < 2) { els.alts.hidden = true; els.alts.innerHTML = ''; return; }
-  els.alts.hidden = false;
-  els.alts.innerHTML = `
-    <h3>Other matches</h3>
-    <p class="hint">Not the right printing? Tap the one that matches your card.</p>
-    <div class="alt-grid">${others.map((c) => `
-      <button type="button" class="alt" data-id="${esc(c.id)}" aria-current="${state.card && c.id === state.card.id}">
-        ${c.image ? `<img loading="lazy" src="${esc(imgUrl(c.image, 'low'))}" alt="">` : '<div class="ph"></div>'}
-        <span>${esc(c.name)}</span>
-        <span class="s">${esc(c.set?.name || setIdOf(c.id))} · ${esc(c.localId)}</span>
-      </button>`).join('')}</div>`;
-  els.alts.querySelectorAll('.alt').forEach((b) => b.addEventListener('click', async () => {
-    setStatus('Loading card…', { busy: true });
-    try {
-      state.confidence = 'picked';
-      await showCard(b.dataset.id);
-      setStatus('Card updated.');
-    } catch (e) { setStatus(e.message, { error: true }); }
-  }));
-}
-
-/* ---------- binder (collection) ---------- */
-
-function entryValueUsd(e) {
-  if (e.usd != null) return e.usd;
-  if (e.eur != null) return e.eur * 1.08; // rough EUR→USD so the total stays in one currency
-  return 0;
-}
-
-function addCurrentToBinder() {
-  const c = state.card;
-  if (!c) return;
-  const mv = marketValue(c, state.variant);
-  const existing = state.collection.find((e) => e.id === c.id && e.variant === state.variant);
-  if (existing) {
-    existing.qty += 1;
+function renderDock() {
+  const showResult = !!state.card && !els.sheet.classList.contains('closed');
+  els.helpBtn.hidden = !state.stream;
+  els.dockReady.hidden = showResult;
+  els.dockResult.hidden = !showResult;
+  if (showResult) {
+    const needPrinting = printingsOf(state.card).length > 1 && !state.printing;
+    els.addBtn.disabled = state.saving || needPrinting || state.confidence === 'demo';
+    els.addBtn.textContent = state.confidence === 'demo' ? 'Demo card' : needPrinting ? 'Choose printing' : 'Add & next';
+    els.skipBtn.textContent = state.confidence === 'demo' ? 'Close' : 'Skip';
   } else {
-    state.collection.unshift({
-      id: c.id, name: c.name, set: c.set?.name || '', localId: c.localId, image: c.image || '',
-      variant: state.variant, usd: mv?.usd ?? null, eur: mv?.eur ?? null, qty: 1, added: Date.now(),
-    });
+    els.scanBtn.disabled = state.busy;
+    els.scanBtn.innerHTML = state.busy ? '<span class="spin"></span> Scanning…'
+      : state.stream ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg> Scan'
+      : 'Start camera';
+  }
+}
+
+/* ---------- chooser & search ---------- */
+
+function rowHtml(c, current) {
+  return `<button type="button" class="list-row" data-id="${esc(c.id)}" aria-current="${current}">
+    ${c.image ? `<img loading="lazy" src="${esc(imgUrl(c.image, 'low'))}" alt="">` : '<div class="ph"></div>'}
+    <span class="t"><span class="n">${esc(c.name)}</span><span class="s">${esc(c.set?.name || setIdOf(c.id))} · #${esc(c.localId)}</span></span>
+    <span></span>
+  </button>`;
+}
+
+function openPanel(p) { p.hidden = false; }
+function closePanel(p) { p.hidden = true; }
+
+function openChooser(auto) {
+  els.chooserNote.textContent = auto
+    ? "The scan wasn't certain. Tap the card that matches yours."
+    : 'Tap the card that matches yours.';
+  els.chooserList.innerHTML = state.candidates.map((c) => rowHtml(c, state.card && c.id === state.card.id)).join('');
+  openPanel(els.chooser);
+}
+
+els.chooserList.addEventListener('click', async (ev) => {
+  const row = ev.target.closest('.list-row');
+  if (!row) return;
+  closePanel(els.chooser);
+  state.confidence = 'picked';
+  try { await openCard(row.dataset.id); } catch (e) { setStatus(e.message, { error: true }); }
+});
+
+async function runSearch(q) {
+  q = q.trim();
+  if (!q) return;
+  els.searchNote.textContent = 'Searching…';
+  els.searchList.innerHTML = '';
+  try {
+    const num = parseNumber(q) || (q.match(/\b\d{1,3}\b/) ? { prefix: '', n: parseInt(q.match(/\b(\d{1,3})\b/)[1], 10), total: null } : null);
+    const namePart = q.replace(/[A-Z]{0,4}\d{1,3}\s*\/\s*[A-Z]{0,4}\d{1,3}/gi, ' ').replace(/\b\d{1,3}\b/g, ' ').replace(/#/g, ' ').trim();
+    const cands = await findCandidates({ exactNames: namePart ? [namePart] : [], names: nameTokens(namePart), num, text: namePart });
+    if (!cands.length) { els.searchNote.textContent = `No cards found for "${q}". Check the spelling, or try just the name.`; return; }
+    state.candidates = cands;
+    els.searchNote.textContent = `${cands.length} match${cands.length === 1 ? '' : 'es'}. Tap yours.`;
+    els.searchList.innerHTML = cands.map((c) => rowHtml(c, false)).join('');
+  } catch (e) {
+    els.searchNote.textContent = e.message || 'Search failed. Try again.';
+  }
+}
+
+els.searchList.addEventListener('click', async (ev) => {
+  const row = ev.target.closest('.list-row');
+  if (!row) return;
+  closePanel(els.searchPanel);
+  state.confidence = 'picked';
+  try { await openCard(row.dataset.id); } catch (e) { setStatus(e.message, { error: true }); }
+});
+
+/* ---------- binder ---------- */
+
+function entryKey(e) { return e.id + '|' + (e.printing || ''); }
+
+function binderStats() {
+  const col = state.collection;
+  const count = col.reduce((s, e) => s + e.qty, 0);
+  const totalUsd = col.reduce((s, e) => s + (e.usd ?? 0) * e.qty, 0);
+  const totalEur = col.reduce((s, e) => s + (e.eur ?? 0) * e.qty, 0);
+  const priced = col.reduce((s, e) => s + ((source() === 'cm' ? e.eur : e.usd) != null ? e.qty : 0), 0);
+  return { count, totalUsd, totalEur, priced };
+}
+
+function renderStrip(addedText) {
+  const { count, totalUsd, totalEur } = binderStats();
+  const label = els.stripLabel;
+  if (addedText) {
+    label.textContent = addedText;
+    label.classList.add('added');
+  } else {
+    label.textContent = count ? `Binder · ${count} card${count === 1 ? '' : 's'}` : 'Binder · empty';
+    label.classList.remove('added');
+  }
+  els.stripTotal.textContent = count ? (source() === 'cm' ? eur(totalEur) : usd(totalUsd)) : '';
+}
+
+function flyToStrip() {
+  if (reducedMotion()) return;
+  const thumb = els.sheetBody.querySelector('.thumb img');
+  if (!thumb) return;
+  const a = thumb.getBoundingClientRect(), b = els.strip.getBoundingClientRect();
+  const fly = thumb.cloneNode();
+  fly.className = 'flyer';
+  Object.assign(fly.style, { left: a.left + 'px', top: a.top + 'px', width: a.width + 'px', height: a.height + 'px' });
+  document.body.appendChild(fly);
+  const dx = b.left + 30 - (a.left + a.width / 2), dy = b.top + b.height / 2 - (a.top + a.height / 2);
+  fly.animate(
+    [{ transform: 'translate(0,0) scale(1)', opacity: 1 }, { transform: `translate(${dx}px, ${dy}px) scale(.28)`, opacity: 0.5 }],
+    { duration: 190, easing: 'cubic-bezier(.3,.7,.4,1)' },
+  ).finished.finally(() => fly.remove());
+}
+
+function addAndNext() {
+  const c = state.card;
+  if (!c || state.saving || state.confidence === 'demo') return;
+  const printings = printingsOf(c);
+  if (printings.length > 1 && !state.printing) return;
+  state.saving = true;
+  renderDock();
+
+  const isNew = !inBinder(c.id);
+  const vals = valuesFor(c, state.printing);
+  const key = c.id + '|' + (state.printing || '');
+  let entry = state.collection.find((e) => entryKey(e) === key);
+  const created = !entry;
+  if (entry) {
+    entry.qty += 1;
+    entry.usd = vals.usd; entry.eur = vals.eur;
+  } else {
+    entry = { id: c.id, name: c.name, set: c.set?.name || '', localId: c.localId, number: numberText(c), image: c.image || '',
+      printing: state.printing, usd: vals.usd, eur: vals.eur, qty: 1, added: Date.now() };
+    state.collection.unshift(entry);
   }
   saveCollection();
-  renderBinder();
-  setStatus(`Added ${c.name} to your binder.`);
+  state.lastAdd = { key, created };
+
+  flyToStrip();
+  haptic();
+  chime();
+  renderStrip(`${isNew ? 'New find · ' : ''}Added · ${c.name} ×${entry.qty}`);
+  els.strip.classList.remove('glint', 'pop'); void els.strip.offsetWidth;
+  els.strip.classList.add(isNew && !reducedMotion() ? 'glint' : 'pop');
+  els.undoBtn.hidden = false;
+  clearTimeout(state.undoTimer);
+  state.undoTimer = setTimeout(endUndo, 7000);
+
+  state.saving = false;
+  backToCamera();
+}
+
+function endUndo() {
+  els.undoBtn.hidden = true;
+  state.lastAdd = null;
+  renderStrip();
+}
+
+function undoAdd() {
+  const la = state.lastAdd;
+  if (!la) return;
+  const i = state.collection.findIndex((e) => entryKey(e) === la.key);
+  if (i >= 0) {
+    if (la.created || state.collection[i].qty <= 1) state.collection.splice(i, 1);
+    else state.collection[i].qty -= 1;
+    saveCollection();
+  }
+  clearTimeout(state.undoTimer);
+  els.undoBtn.hidden = true;
+  state.lastAdd = null;
+  renderStrip('Removed the last card');
+  setTimeout(() => { if (!state.lastAdd) renderStrip(); }, 1800);
+  if (!els.binderPanel.hidden) renderBinder();
 }
 
 function renderBinder() {
   const col = state.collection;
-  const count = col.reduce((s, e) => s + e.qty, 0);
-  const total = col.reduce((s, e) => s + entryValueUsd(e) * e.qty, 0);
-  els.ledgerTotal.textContent = usd(total);
-  els.ledgerCount.textContent = `${count} card${count === 1 ? '' : 's'}`;
-  els.binder.hidden = !col.length;
-  els.ledgerTools.hidden = !col.length;
-  els.ledgerEmpty.hidden = !!col.length;
-  els.binderBody.innerHTML = col.map((e, i) => `
-    <tr>
-      <td>${e.image ? `<img src="${esc(imgUrl(e.image, 'low'))}" alt="">` : ''}</td>
-      <td><div class="nm">${esc(e.name)}</div><div class="st">${esc(e.set)} · #${esc(e.localId)}</div></td>
-      <td>${e.variant ? esc(variantLabel(e.variant)) : '—'}</td>
-      <td><span class="qty"><button type="button" data-act="dec" data-i="${i}" aria-label="One fewer">−</button>${e.qty}<button type="button" data-act="inc" data-i="${i}" aria-label="One more">+</button></span></td>
-      <td class="money">${e.usd != null ? usd(e.usd) : e.eur != null ? eur(e.eur) : '—'}</td>
-      <td class="money">${usd(entryValueUsd(e) * e.qty)}</td>
-      <td><button class="btn small ghost" type="button" data-act="del" data-i="${i}">Remove</button></td>
-    </tr>`).join('');
+  const { count, totalUsd, totalEur, priced } = binderStats();
+  const cm = source() === 'cm';
+  if (!col.length) {
+    els.binderBody.innerHTML = '<p class="empty-note">No cards yet. Scan a card and tap <b>Add &amp; next</b> to start your binder.</p>';
+    return;
+  }
+  els.binderBody.innerHTML = `
+    <div class="binder-sum">
+      <span class="price-label">${cm ? 'Cardmarket trend · EUR' : 'TCGplayer market · USD'}</span>
+      <span class="big">${cm ? eur(totalEur) : usd(totalUsd)}</span>
+      <span class="eur">${cm ? usd(totalUsd) : eur(totalEur)} <small class="price-label">${cm ? 'TCGplayer market · USD' : 'Cardmarket trend · EUR'}</small></span>
+      <span class="meta">${count} card${count === 1 ? '' : 's'} · ${priced} of ${count} priced</span>
+    </div>
+    <div class="list">
+      ${col.map((e, i) => `
+        <div class="list-row binder-row">
+          ${e.image ? `<img loading="lazy" src="${esc(imgUrl(e.image, 'low'))}" alt="">` : '<div class="ph"></div>'}
+          <span class="t">
+            <span class="n">${esc(e.name)}</span>
+            <span class="s">${e.printing ? esc(printingLabel(e.printing)) + ' · ' : ''}${esc(e.set)} #${esc(e.number || e.localId)}</span>
+            <span class="qty">
+              <button type="button" data-act="dec" data-i="${i}" aria-label="${e.qty > 1 ? 'One fewer' : 'Remove'} ${esc(e.name)}">${e.qty > 1 ? '−' : '×'}</button>
+              <span>${e.qty}</span>
+              <button type="button" data-act="inc" data-i="${i}" aria-label="One more ${esc(e.name)}">+</button>
+            </span>
+          </span>
+          <span class="v">
+            <span class="usd mono">${cm ? (e.eur != null ? eur(e.eur * e.qty) : 'No price') : (e.usd != null ? usd(e.usd * e.qty) : 'No price')}</span>
+            <span class="eur mono">${cm ? (e.usd != null ? usd(e.usd * e.qty) : '') : (e.eur != null ? eur(e.eur * e.qty) : '')}</span>
+          </span>
+        </div>`).join('')}
+    </div>
+    <div class="binder-tools">
+      <button class="btn" type="button" data-act="refresh">Refresh prices</button>
+      <button class="btn" type="button" data-act="csv">Export CSV</button>
+      <button class="btn" type="button" data-act="clear">Clear binder</button>
+    </div>
+    <div class="binder-tools" id="confirmClear" hidden>
+      <span class="confirm">Remove all ${count} cards from the binder?</span>
+      <button class="btn primary" type="button" data-act="clear-yes">Yes, clear</button>
+      <button class="btn" type="button" data-act="clear-no">Keep them</button>
+    </div>`;
 }
 
 els.binderBody.addEventListener('click', (ev) => {
   const b = ev.target.closest('button[data-act]');
   if (!b) return;
-  const i = +b.dataset.i, e = state.collection[i];
-  if (!e) return;
-  if (b.dataset.act === 'inc') e.qty += 1;
-  if (b.dataset.act === 'dec') e.qty = Math.max(1, e.qty - 1);
-  if (b.dataset.act === 'del') state.collection.splice(i, 1);
+  const act = b.dataset.act;
+  const e = state.collection[+b.dataset.i];
+  if (act === 'inc' && e) e.qty += 1;
+  else if (act === 'dec' && e) { if (e.qty > 1) e.qty -= 1; else state.collection.splice(+b.dataset.i, 1); }
+  else if (act === 'refresh') return refreshPrices(b);
+  else if (act === 'csv') return exportCsv();
+  else if (act === 'clear') { $('#confirmClear').hidden = false; return; }
+  else if (act === 'clear-no') { $('#confirmClear').hidden = true; return; }
+  else if (act === 'clear-yes') state.collection = [];
   saveCollection();
   renderBinder();
+  renderStrip();
 });
 
-async function refreshAllPrices() {
-  if (!state.collection.length) return;
-  els.refreshAll.disabled = true;
-  let done = 0, failed = 0;
-  for (const e of state.collection) {
-    setStatus(`Refreshing prices… ${done + 1} of ${state.collection.length}`, { busy: true, progress: done / state.collection.length });
+async function refreshPrices(btn) {
+  btn.disabled = true;
+  let failed = 0;
+  for (let i = 0; i < state.collection.length; i++) {
+    const e = state.collection[i];
+    btn.textContent = `Refreshing ${i + 1}/${state.collection.length}…`;
     try {
       const card = await getJSON(`${API}/cards/${encodeURIComponent(e.id)}`);
-      const mv = marketValue(card, e.variant || tcgVariants(card)[0]);
-      e.usd = mv?.usd ?? null; e.eur = mv?.eur ?? null;
+      const vals = valuesFor(card, e.printing || printingsOf(card)[0]);
+      e.usd = vals.usd; e.eur = vals.eur;
     } catch { failed++; }
-    done++;
   }
   saveCollection();
   renderBinder();
-  els.refreshAll.disabled = false;
-  setStatus(failed ? `Prices refreshed, but ${failed} card${failed === 1 ? '' : 's'} could not be reached.` : 'All prices refreshed.', { error: !!failed });
+  renderStrip(failed ? `${failed} card${failed === 1 ? '' : 's'} couldn't refresh` : 'Prices refreshed');
+  setTimeout(() => renderStrip(), 2200);
 }
 
 function exportCsv() {
-  const rows = [['Name', 'Set', 'Number', 'Variant', 'Qty', 'Each (USD)', 'Each (EUR)', 'Total (USD)', 'TCGdex ID']];
+  const rows = [['Name', 'Set', 'Number', 'Printing', 'Qty', 'TCGplayer market (USD)', 'Cardmarket trend (EUR)', 'Total USD', 'Total EUR', 'TCGdex ID']];
   for (const e of state.collection) {
-    rows.push([e.name, e.set, e.localId, e.variant ? variantLabel(e.variant) : '', e.qty, e.usd ?? '', e.eur ?? '', (entryValueUsd(e) * e.qty).toFixed(2), e.id]);
+    rows.push([e.name, e.set, e.number || e.localId, e.printing ? printingLabel(e.printing) : '', e.qty, e.usd ?? '', e.eur ?? '',
+      e.usd != null ? (e.usd * e.qty).toFixed(2) : '', e.eur != null ? (e.eur * e.qty).toFixed(2) : '', e.id]);
   }
   const csv = rows.map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\r\n');
   const a = document.createElement('a');
@@ -696,52 +930,66 @@ function exportCsv() {
 
 /* ---------- settings ---------- */
 
-function renderMode() {
-  const ai = !!apiKey();
-  els.modePill.classList.toggle('ai', ai);
-  els.modeText.textContent = ai ? 'Claude vision' : 'Text reader';
-}
-
-els.settingsBtn.addEventListener('click', () => { els.apiKey.value = apiKey(); els.settings.showModal(); });
+els.settingsBtn.addEventListener('click', () => {
+  els.apiKey.value = apiKey();
+  els.soundOpt.checked = soundOn();
+  els.settings.querySelectorAll('input[name=source]').forEach((r) => { r.checked = r.value === source(); });
+  els.settings.showModal();
+});
 els.settings.addEventListener('close', () => {
-  const v = els.settings.returnValue;
-  if (v === 'save') storageSet('pokescan.apiKey', els.apiKey.value.trim());
-  if (v === 'clear') storageSet('pokescan.apiKey', '');
-  renderMode();
+  if (els.settings.returnValue !== 'save') return;
+  storageSet('pokescan.apiKey', els.apiKey.value.trim());
+  storageSet('pokescan.sound', els.soundOpt.checked);
+  const s = els.settings.querySelector('input[name=source]:checked');
+  if (s) storageSet('pokescan.source', s.value);
+  renderStrip();
+  if (state.card) renderSheet();
+  if (!els.binderPanel.hidden) renderBinder();
 });
 
 /* ---------- wiring ---------- */
 
-els.startCam.addEventListener('click', () => startCamera());
-els.camSelect.addEventListener('change', () => startCamera(els.camSelect.value));
-els.scanBtn.addEventListener('click', scanFromCamera);
-els.fileInput.addEventListener('change', () => { scanFromFile(els.fileInput.files[0]); els.fileInput.value = ''; });
-els.searchForm.addEventListener('submit', (e) => { e.preventDefault(); manualSearch(els.searchInput.value); });
-els.refreshAll.addEventListener('click', refreshAllPrices);
-els.exportCsv.addEventListener('click', exportCsv);
-els.clearAll.addEventListener('click', () => { els.confirmClear.hidden = false; els.clearAll.hidden = true; });
-els.confirmClearNo.addEventListener('click', () => { els.confirmClear.hidden = true; els.clearAll.hidden = false; });
-els.confirmClearYes.addEventListener('click', () => {
-  state.collection = []; saveCollection(); renderBinder();
-  els.confirmClear.hidden = true; els.clearAll.hidden = false;
+els.scanBtn.addEventListener('click', onScan);
+els.searchBtn.addEventListener('click', () => { openPanel(els.searchPanel); setTimeout(() => els.searchInput.focus(), 50); });
+els.searchForm.addEventListener('submit', (e) => { e.preventDefault(); els.searchInput.blur(); runSearch(els.searchInput.value); });
+els.fileInput.addEventListener('change', () => { scanFile(els.fileInput.files[0]); els.fileInput.value = ''; });
+els.skipBtn.addEventListener('click', backToCamera);
+els.addBtn.addEventListener('click', addAndNext);
+els.undoBtn.addEventListener('click', undoAdd);
+els.stripMain.addEventListener('click', () => { renderBinder(); openPanel(els.binderPanel); });
+els.helpBtn.addEventListener('click', () => setHelp(!els.guide.classList.contains('help')));
+els.lightbox.addEventListener('click', () => { els.lightbox.hidden = true; });
+els.demoBtn.addEventListener('click', async () => {
+  state.candidates = [];
+  try { await openCard('base1-4', { demo: true }); } catch (e) { setStatus(e.message, { error: true }); }
 });
+document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closePanel($('#' + b.dataset.close))));
 
 document.addEventListener('keydown', (e) => {
-  if ((e.code === 'Space' || e.key === 'Enter') && !e.target.closest('input, textarea, select, button, a, dialog')) {
+  if (e.key === 'Escape') {
+    if (!els.lightbox.hidden) { els.lightbox.hidden = true; return; }
+    const open = [els.chooser, els.searchPanel, els.binderPanel].find((p) => !p.hidden);
+    if (open) { closePanel(open); return; }
+    if (state.card) backToCamera();
+    return;
+  }
+  if (e.code === 'Space' && !e.target.closest('input, textarea, select, button, a, dialog') && !state.card) {
     e.preventDefault();
-    scanFromCamera();
+    onScan();
   }
 });
 
-// Drag a photo anywhere onto the scanner.
-els.viewfinder.addEventListener('dragover', (e) => e.preventDefault());
-els.viewfinder.addEventListener('drop', (e) => { e.preventDefault(); scanFromFile(e.dataTransfer.files[0]); });
+// Drop a photo anywhere on the camera.
+els.stage.addEventListener('dragover', (e) => e.preventDefault());
+els.stage.addEventListener('drop', (e) => { e.preventDefault(); scanFile(e.dataTransfer.files[0]); });
 
-renderMode();
-renderBinder();
+renderStrip();
+renderDock();
+setStatus('');
 getSets().catch(() => {});
-// Open on a real example so the price layout is visible before the first scan.
-state.confidence = 'example';
-showCard('base1-4').catch(() => {
-  els.emptySlip.innerHTML = 'Scan a card to see its value here.';
-});
+// Open straight into the camera if the person already allowed it here before.
+(async () => {
+  let granted = false;
+  try { granted = (await navigator.permissions?.query({ name: 'camera' }))?.state === 'granted'; } catch { /* unsupported */ }
+  if (granted || storageGet('pokescan.camOk', false)) startCamera();
+})();
