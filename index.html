@@ -278,6 +278,50 @@ dialog input[type=password] { width: 100%; min-height: 46px; padding: 0 12px; bo
 dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
 dialog .row .btn { min-height: 44px; }
 
+/* Scan mode switch */
+.modes {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 4;
+  display: flex; padding: 3px; gap: 2px; border-radius: 999px; background: rgba(13, 15, 20, .78);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+}
+.modes button, .seg button {
+  min-height: 40px; padding: 0 16px; border: 0; border-radius: 999px; background: transparent; color: var(--muted);
+  font-weight: 700; font-size: .9rem; white-space: nowrap;
+}
+.modes button[aria-selected="true"], .seg button[aria-selected="true"] { background: var(--text); color: var(--bg); }
+.seg { display: flex; gap: 2px; padding: 3px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); margin-bottom: 12px; }
+.seg button { flex: 1; min-height: 42px; }
+.stage.multi .guide { display: none; }
+.needs-ai { position: absolute; inset: 0; z-index: 3; display: grid; place-content: center; justify-items: center; gap: 12px; text-align: center; padding: 24px 24px 72px; background: rgba(7, 8, 11, .9); }
+.needs-ai h2 { font: 800 1.35rem/1.15 var(--font-display); margin: 0; text-wrap: balance; }
+.needs-ai p { margin: 0; color: var(--muted); max-width: 32ch; }
+.tip { font-size: .85rem; }
+.link { border: 0; background: none; padding: 0; color: var(--text); text-decoration: underline; text-underline-offset: 3px; font-weight: 600; }
+
+/* Multi-scan results */
+.panel-foot {
+  flex: none; display: flex; gap: 8px; border-top: 1px solid var(--line); background: var(--bg);
+  padding: 10px max(16px, env(safe-area-inset-right, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+.panel-foot .btn { min-height: 56px; }
+.panel-foot .btn.primary { flex: 1; }
+.batch-row { grid-template-columns: 44px 52px minmax(0, 1fr) auto; padding-left: 0; }
+.batch-row.off { opacity: .5; }
+.check { width: 44px; height: 44px; display: grid; place-items: center; border: 0; background: transparent; }
+.check span { width: 24px; height: 24px; border-radius: 7px; border: 2px solid var(--line); display: grid; place-items: center; font-weight: 800; color: var(--accent-ink); }
+.check[aria-checked="true"] span { background: var(--accent); border-color: var(--accent); }
+.check[aria-checked="true"] span::before { content: "✓"; font-size: 14px; }
+.batch-row .pick { border: 0; background: transparent; padding: 0; text-align: left; display: contents; }
+.batch-row select { margin-top: 4px; min-height: 36px; max-width: 100%; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 8px; font-size: .85rem; font-weight: 600; }
+.batch-row .miss { color: var(--warn); font-size: .84rem; font-weight: 600; }
+.sealed-img { object-fit: contain !important; background: #fff !important; }
+
+dialog .opt-note { color: var(--muted); font-weight: 400; font-size: .82rem; }
+dialog .keys { display: grid; gap: 10px; margin-top: 8px; }
+dialog .field { display: grid; gap: 6px; font-weight: 600; font-size: .88rem; }
+dialog input[type=text] { width: 100%; min-height: 46px; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); font-family: var(--font-mono); font-size: .9rem; }
+.dialog-err { color: #ffb4a6 !important; margin: 8px 0 0 !important; }
+
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -309,9 +353,20 @@ dialog .row .btn { min-height: 44px; }
         <div class="pill" id="statusPill" aria-live="polite"><span id="statusText">Fit the whole card inside the frame.</span></div>
         <button class="help-btn" id="helpBtn" type="button" aria-pressed="false" aria-label="Show where the name and number go">?</button>
       </div>
+      <div class="modes" id="modes" role="tablist" aria-label="Scan mode">
+        <button type="button" role="tab" data-mode="card" aria-selected="true">Card</button>
+        <button type="button" role="tab" data-mode="multi" aria-selected="false">Multi &amp; sealed</button>
+      </div>
+      <div class="needs-ai" id="needsAi" hidden>
+        <h2>Scan many cards or sealed product</h2>
+        <p>Lay out several cards, or point at a booster box, ETB, tin or pack. This mode uses Claude or ChatGPT to see the whole photo, so it needs an API key.</p>
+        <button class="btn primary" type="button" id="needsAiSetup">Connect Claude or ChatGPT</button>
+        <button class="text-btn" type="button" id="needsAiSearch">Or search sealed by name</button>
+      </div>
       <div class="stage-empty" id="stageEmpty">
         <h2>Your next find goes here</h2>
         <p>Tap <b>Start camera</b> below, hold a card in the frame and tap Scan. Its market value shows up in a couple of seconds.</p>
+        <p class="tip" id="aiTip">For the most accurate scans, connect Claude or ChatGPT in <button class="link" type="button" id="aiTipBtn">Settings</button>.</p>
         <button class="text-btn" id="demoBtn" type="button">View demo</button>
       </div>
     </div>
@@ -358,14 +413,28 @@ dialog .row .btn { min-height: 44px; }
 
   <!-- Search -->
   <section class="panel" id="searchPanel" hidden aria-label="Search cards">
-    <div class="panel-head"><h2>Search cards</h2><button class="icon-btn" data-close="searchPanel" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <div class="panel-head"><h2>Search</h2><button class="icon-btn" data-close="searchPanel" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
     <div class="panel-body">
+      <div class="seg" role="tablist" aria-label="What to search">
+        <button type="button" role="tab" data-kind="card" aria-selected="true">Cards</button>
+        <button type="button" role="tab" data-kind="sealed" aria-selected="false">Sealed</button>
+      </div>
       <form class="search-box" id="searchForm">
         <input id="searchInput" type="search" placeholder="Charizard 4/102" autocomplete="off" enterkeyhint="search" aria-label="Card name and number">
         <button class="btn primary" type="submit">Go</button>
       </form>
       <p class="panel-note" id="searchNote">Type the name, and the number from the bottom corner if you have it.</p>
       <div class="list" id="searchList"></div>
+    </div>
+  </section>
+
+  <!-- Multi-scan results -->
+  <section class="panel" id="batchPanel" hidden aria-label="Scan results">
+    <div class="panel-head"><h2 id="batchTitle">Found items</h2><button class="icon-btn" data-close="batchPanel" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <div class="panel-body"><p class="panel-note" id="batchNote">Untick anything you don't want. Tap an item to fix the match.</p><div class="list" id="batchList"></div></div>
+    <div class="panel-foot">
+      <button class="btn" type="button" id="batchRescan">Rescan</button>
+      <button class="btn primary" type="button" id="batchAdd">Add to binder</button>
     </div>
   </section>
 
@@ -391,9 +460,23 @@ dialog .row .btn { min-height: 44px; }
       <label class="opt"><input type="checkbox" id="soundOpt"> Play a sound when a card is added</label>
     </fieldset>
     <fieldset>
-      <legend>Sharper recognition</legend>
-      <p>The free on-device reader handles most regular cards. Paste an Anthropic API key and Claude will read holos, full-arts and blurry shots instead (about a cent per scan). The key stays in this browser only.</p>
-      <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off" spellcheck="false" aria-label="Anthropic API key">
+      <legend>Card reader</legend>
+      <p>Claude and ChatGPT read holos, full-arts, blurry shots, several cards at once and sealed product. Each scan costs about a cent on your own API key. Keys stay in this browser only.</p>
+      <label class="opt"><input type="radio" name="provider" value="claude"> Claude <span class="opt-note">Anthropic API key</span></label>
+      <label class="opt"><input type="radio" name="provider" value="openai"> ChatGPT <span class="opt-note">OpenAI API key</span></label>
+      <label class="opt"><input type="radio" name="provider" value="ocr"> On-device <span class="opt-note">free, single cards only</span></label>
+      <div class="keys">
+        <label class="field" id="claudeField">Anthropic API key
+          <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field" id="openaiField">OpenAI API key
+          <input id="openaiKey" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field" id="openaiModelField">ChatGPT model
+          <input id="openaiModel" type="text" placeholder="gpt-5-mini" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+      <p class="dialog-err" id="settingsErr" hidden></p>
     </fieldset>
     <div class="row">
       <button class="btn" value="cancel" type="submit">Cancel</button>
