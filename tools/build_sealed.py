@@ -24,9 +24,12 @@ def get(url):
             time.sleep(2)
 
 
+SINGLE_CARD_FIELDS = {"Number", "Card Type", "HP", "Stage", "Attack 1"}
+
+
 def is_sealed(p):
-    # Singles carry a collector Number; sealed products and accessories do not.
-    if any(e.get("name") == "Number" for e in p.get("extendedData", [])):
+    # Loose cards carry card details (a collector number, card type, HP...); sealed products do not.
+    if any(e.get("name") in SINGLE_CARD_FIELDS for e in p.get("extendedData", [])):
         return False
     return not p["name"].lower().startswith("code card")
 

@@ -1,0 +1,30 @@
+name: Refresh picture fingerprints
+
+# Adds fingerprints for newly released cards and sealed products so the app can recognise them.
+on:
+  schedule:
+    - cron: "10 9 * * 1"   # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pillow
+      - run: python tools/build_cards.py
+      - run: python tools/build_sealed_pics.py
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cards.json data/cards.bin data/sealed_pics.json data/sealed_pics.bin
+          git diff --cached --quiet || git commit -m "Refresh picture fingerprints"
+          git pull --rebase
+          git push

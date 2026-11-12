@@ -7,8 +7,8 @@ const $ = (s) => document.querySelector(s);
 
 const els = {
   app: $('#app'), stage: $('#stage'), video: $('#video'), still: $('#still'), guide: $('#guide'),
-  stageEmpty: $('#stageEmpty'), demoBtn: $('#demoBtn'), aiTip: $('#aiTip'), aiTipBtn: $('#aiTipBtn'),
-  modes: $('#modes'), needsAi: $('#needsAi'), needsAiSetup: $('#needsAiSetup'), needsAiSearch: $('#needsAiSearch'),
+  stageEmpty: $('#stageEmpty'), demoBtn: $('#demoBtn'),
+  modes: $('#modes'),
   statusPill: $('#statusPill'), helpBtn: $('#helpBtn'),
   sheet: $('#sheet'), sheetBody: $('#sheetBody'),
   strip: $('#strip'), stripMain: $('#stripMain'), stripLabel: $('#stripLabel'), stripTotal: $('#stripTotal'), undoBtn: $('#undoBtn'),
@@ -27,7 +27,7 @@ const state = {
   stream: null,
   busy: false,
   saving: false,
-  mode: storageGet('pokescan.mode', 'card'),   // 'card' | 'multi'
+  mode: storageGet('pokescan.mode', 'card'),   // 'card' | 'multi' | 'sealed'
   card: null,            // full TCGdex card on the sheet
   sealed: null,          // sealed product on the sheet
   printing: null,        // chosen printing key, or null when the person still has to choose
@@ -94,7 +94,7 @@ function setStatus(msg, { busy = false, error = false } = {}) {
 }
 function idleStatus() {
   if (!state.stream) return setStatus('');
-  setStatus(state.mode === 'multi' ? 'Fit everything in view, then tap Scan all.' : 'Fit the whole card inside the frame.');
+  setStatus({ multi: 'Lay cards on a plain surface with gaps, then Scan all.', sealed: 'Fill the view with the front of the box or pack.' }[state.mode] || 'Fit the whole card inside the frame.');
 }
 
 const imgUrl = (base, q = 'high') => (base ? `${base}/${q}.webp` : '');
@@ -134,16 +134,23 @@ const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)'
 
 /* ---------- camera ---------- */
 
+let camGen = 0; // bumps on every start/stop so a slow camera start can tell it was superseded
+
 async function startCamera() {
   stopCamera();
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus('This browser cannot open the camera here. Use Upload instead.', { error: true });
     return;
   }
+  const gen = camGen;
   try {
-    state.stream = await navigator.mediaDevices.getUserMedia({
+    const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false,
     });
+    // Something else took over while the camera was opening (e.g. a photo was picked): drop this stream.
+    if (gen !== camGen) { stream.getTracks().forEach((t) => t.stop()); return; }
+    state.stream = stream;
+    keepAwake(true);
     const track = state.stream.getVideoTracks()[0];
     // Keep refocusing as cards move in and out (supported on most Android phones; ignored elsewhere).
     try { await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch { /* unsupported */ }
@@ -165,32 +172,41 @@ async function startCamera() {
 }
 
 function stopCamera() {
+  camGen++;
   if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
   state.stream = null;
+  keepAwake(false);
 }
+
+/** Stop the phone screen dimming while the camera is in use (where the browser supports it). */
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && 'wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!on && wakeLock) {
+      const w = wakeLock; wakeLock = null;
+      await w.release();
+    }
+  } catch { /* unsupported or refused */ }
+}
+
+// Phones kill the camera feed when the app goes to the background; release it cleanly and reopen on return.
+let resumeCamera = false;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    resumeCamera = !!state.stream;
+    stopCamera();
+  } else if (resumeCamera) {
+    resumeCamera = false;
+    if (els.still.hidden) startCamera();
+  }
+});
 
 function setHelp(on) {
   els.guide.classList.toggle('help', on);
   els.helpBtn.setAttribute('aria-pressed', String(on));
-}
-
-/** Crop the area inside the on-screen card guide out of the live video frame. */
-function grabGuide() {
-  const v = els.video, vw = v.videoWidth, vh = v.videoHeight;
-  const box = els.stage.getBoundingClientRect();
-  const g = els.guide.getBoundingClientRect();
-  const scale = Math.max(box.width / vw, box.height / vh); // object-fit: cover
-  const ox = (box.width - vw * scale) / 2, oy = (box.height - vh * scale) / 2;
-  const pad = 0.03;
-  let sx = (g.left - box.left - ox) / scale - (g.width / scale) * pad;
-  let sy = (g.top - box.top - oy) / scale - (g.height / scale) * pad;
-  let sw = (g.width / scale) * (1 + 2 * pad), sh = (g.height / scale) * (1 + 2 * pad);
-  sx = Math.max(0, sx); sy = Math.max(0, sy);
-  sw = Math.min(vw - sx, sw); sh = Math.min(vh - sy, sh);
-  const c = document.createElement('canvas');
-  c.width = Math.round(sw); c.height = Math.round(sh);
-  c.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
-  return c;
 }
 
 /** The whole view at the best resolution available: a real photo where the browser allows it, else the video frame. */
@@ -229,22 +245,29 @@ function band(src, y0, y1, x0 = 0, x1 = 1, targetW = 1600) {
   const k = targetW / sw;
   const c = document.createElement('canvas');
   c.width = Math.round(targetW); c.height = Math.max(1, Math.round(sh * k));
-  const ctx = c.getContext('2d');
-  ctx.filter = 'grayscale(1) contrast(1.8)';
+  const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(src, src.width * x0, src.height * y0, sw, sh, 0, 0, c.width, c.height);
+  // Grayscale + contrast by hand: canvas filters are missing in some iPhone browsers.
+  const im = ctx.getImageData(0, 0, c.width, c.height), d = im.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const g = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    d[i] = d[i + 1] = d[i + 2] = Math.max(0, Math.min(255, (g - 128) * 1.8 + 128));
+  }
+  ctx.putImageData(im, 0, 0);
   return c;
 }
 
-async function ocrCard(canvas) {
+async function ocrCard(canvas, { quick = false, numberOnly = false } = {}) {
   const worker = await getWorker();
-  const out = {};
+  const out = { top: '', full: '' };
   // The collector number is tiny, so read each bottom corner on its own at roughly 3x zoom.
-  for (const [key, img] of [
-    ['top', band(canvas, 0, 0.14, 0, 0.78)],
-    ['bottomLeft', band(canvas, 0.85, 1, 0, 0.55)],
-    ['bottomRight', band(canvas, 0.85, 1, 0.45, 1)],
-    ['full', band(canvas, 0, 1, 0, 1, 1200)],
-  ]) {
+  const passes = [
+    ['bottomLeft', band(canvas, 0.86, 1, 0, 0.55, 1100)],
+    ['bottomRight', band(canvas, 0.86, 1, 0.45, 1, 1100)],
+  ];
+  if (!numberOnly) passes.unshift(['top', band(canvas, 0, 0.14, 0, 0.78)]);
+  if (!quick) passes.push(['full', band(canvas, 0, 1, 0, 1, 1200)]);
+  for (const [key, img] of passes) {
     const { data } = await worker.recognize(img);
     out[key] = data.text || '';
   }
@@ -435,7 +458,12 @@ function nameScore(cardName, hay, exactNames) {
  * Look up possible cards in TCGdex and rank them.
  * hints: { names: string[], exactNames: string[], num, text, setName }
  */
-async function findCandidates(hints) {
+async function findCandidates(hints, limit = 18) {
+  try { return scoreLocal(await getIndex(), hints, null, limit); } catch { return findCandidatesOnline(hints); }
+}
+
+/** The same lookup against the TCGdex API, used only if the local picture index can't be loaded. */
+async function findCandidatesOnline(hints) {
   const { names = [], exactNames = [], num = null, text = '', setName = '' } = hints;
   const setsMap = await getSets();
   const queries = [];
@@ -589,51 +617,117 @@ function valuesFor(card, printing) {
 
 /* ---------- scan flow ---------- */
 
-async function identify(canvas, { wide = false } = {}) {
+/** Where the on-screen card guide sits, in video-frame pixels. */
+function guideInFrame() {
+  const v = els.video, vw = v.videoWidth, vh = v.videoHeight;
+  const box = els.stage.getBoundingClientRect();
+  const g = els.guide.getBoundingClientRect();
+  const scale = Math.max(box.width / vw, box.height / vh); // object-fit: cover
+  const ox = (box.width - vw * scale) / 2, oy = (box.height - vh * scale) / 2;
+  return { x: (g.left - box.left - ox) / scale, y: (g.top - box.top - oy) / scale, w: g.width / scale, h: g.height / scale };
+}
+
+function grabFrame() {
+  const v = els.video;
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, 0);
+  return c;
+}
+
+function cropCanvas(src, x, y, w, h) {
+  x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
+  w = Math.min(src.width - x, Math.round(w)); h = Math.min(src.height - y, Math.round(h));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d', { willReadFrequently: true }).drawImage(src, x, y, w, h, 0, 0, w, h);
+  return c;
+}
+
+/** Recognise the single card inside the guide: by the guide itself, and by the card's real outline if it can be found. */
+async function recognizeGuideCard(index, frame, g) {
+  const views = [rectify(frame, { cx: g.x + g.w / 2, cy: g.y + g.h / 2, w: g.w, h: g.h, angle: 0 })];
+  const pad = 0.16;
+  const rx = Math.max(0, g.x - g.w * pad), ry = Math.max(0, g.y - g.h * pad);
+  const region = cropCanvas(frame, rx, ry, g.w * (1 + 2 * pad), g.h * (1 + 2 * pad));
+  const found = detectCards(region, { minFrac: 0.2 }).sort((a, b) => b.w * b.h - a.w * a.h)[0];
+  if (found && Math.abs(found.angle) < 0.5) views.push(rectify(frame, { ...found, cx: found.cx + rx, cy: found.cy + ry }));
+  return recognizeCard(index, views);
+}
+
+/** Recognise whatever cards are in a photo that has no guide (an upload, or Multi mode). */
+async function recognizePhoto(index, frame) {
+  const many = await recognizeMany(index, frame, (i, n) => setStatus(n > 1 ? `Found ${n} cards. Matching ${i} of ${n}…` : 'Matching the card…', { busy: true }));
+  if (many.length) return many;
+  // Nothing stood out from the background: maybe the card fills the whole photo.
+  const res = await recognizeCard(index, [rectify(frame, { cx: frame.width / 2, cy: frame.height / 2, w: frame.width, h: frame.height, angle: 0 }, 0)], { allowFlip: true });
+  return res.cands.length && res.d <= 0.27 ? [res] : [];
+}
+
+/**
+ * Scan a picture.
+ *  frame: canvas with the whole view; guide: the card guide's rectangle in it (live Card mode only).
+ * On-device recognition runs first and is free; Claude/ChatGPT is only asked when it's connected and needed.
+ */
+async function scan(frame, { guide = null } = {}) {
   if (state.busy) return;
   state.busy = true;
   renderDock();
   els.guide.classList.add('captured');
+  const mode = state.mode;
+  const ai = activeAI();
   try {
-    const ai = activeAI();
-    if (ai) {
-      setStatus(wide ? `${aiName()} is looking at everything…` : 'Reading card…', { busy: true });
-      let items;
-      try {
-        items = await aiItems(canvas, wide);
-      } catch (e) {
-        if (wide) throw e;
-        setStatus(`${e.message} Using the on-device reader…`, { busy: true, error: true });
-      }
-      if (items) {
-        if (!items.length) { setStatus(wide ? 'No Pokémon cards or sealed product found. Try more light or get closer.' : "That doesn't look like a Pokémon card. Try again.", { error: true }); return; }
-        countScan();
-        if (items.length === 1) return await showSingle(items[0]);
-        return await showBatch(items);
-      }
+    let index = null;
+    if (mode !== 'sealed') {
+      setStatus('Matching the card…', { busy: true });
+      try { index = await getIndex(); } catch { /* fall back to reading the text */ }
     }
-    // Free on-device path: single cards only.
-    setStatus('Reading card…', { busy: true });
-    const t = await ocrCard(canvas);
-    const hints = {
-      names: nameTokens(t.top).concat(nameTokens(t.full).slice(0, 1)),
-      num: parseNumber(t.bottom) || parseNumber(t.full),
-      text: t.top + ' ' + t.full,
-    };
-    setStatus('Finding match…', { busy: true });
-    const cands = await findCandidates(hints);
-    if (!cands.length) {
-      const seen = [hints.names?.[0], hints.num && `${hints.num.prefix}${hints.num.n}${hints.num.total ? '/' + hints.num.total : ''}`].filter(Boolean).join(', ');
-      setStatus(`No match${seen ? ` for "${seen}"` : ''}. Move closer, cut the glare, or connect Claude or ChatGPT in Settings.`, { error: true });
+
+    // ----- sealed product -----
+    if (mode === 'sealed') {
+      if (ai) return await scanWithAI(frame, true);
+      setStatus('Matching the product…', { busy: true });
+      const cands = await readSealed(frame);
+      if (!cands.length) { setStatus("Couldn't recognize that product. Try the front of the box in good light, or use Search → Sealed.", { error: true }); return; }
+      countScan();
+      state.candidates = cands;
+      state.confidence = sealedPictureConfidence(cands);
+      openSealed(cands[0]);
+      idleStatus();
+      if (state.confidence === 'guess') openSealedChooser(true);
+      return;
+    }
+
+    // ----- one card in the guide -----
+    if (mode === 'card' && guide) {
+      let res = null;
+      if (index) res = await recognizeGuideCard(index, frame, guide);
+      if (res?.confidence === 'strong') return await showCardResult(res);
+      if (ai) {
+        try { return await scanWithAI(cropCanvas(frame, guide.x - guide.w * 0.03, guide.y - guide.h * 0.03, guide.w * 1.06, guide.h * 1.06), false); }
+        catch (e) { if (!res?.cands.length) throw e; }
+      }
+      if (res?.cands.length) return await showCardResult(res);
+      if (!index) return await scanByTextOnly(cropCanvas(frame, guide.x, guide.y, guide.w, guide.h));
+      setStatus('No match. Line the card up with the corners, cut the glare, and try again.', { error: true });
+      return;
+    }
+
+    // ----- several cards, or an uploaded photo -----
+    if (ai && (mode === 'multi' || !index)) return await scanWithAI(frame, true);
+    if (!index) return await scanByTextOnly(frame);
+    const results = await recognizePhoto(index, frame);
+    if (!results.length) {
+      if (ai) return await scanWithAI(frame, true);
+      setStatus('No cards found. Lay them on a plain surface with a little space between each, then try again.', { error: true });
       return;
     }
     countScan();
-    state.candidates = cands;
-    state.confidence = confidenceOf(cands);
-    setStatus('Getting prices…', { busy: true });
-    await openCard(cands[0].id);
-    idleStatus();
-    if (state.confidence === 'guess') openCardChooser(true);
+    if (results.length === 1) {
+      if (results[0].confidence !== 'strong' && ai) { try { return await scanWithAI(frame, true); } catch { /* keep the on-device answer */ } }
+      return await showCardResult(results[0], false);
+    }
+    await showBatch(results.map((r) => ({ kind: 'card', label: r.cands[0]?.name || 'Unreadable card', query: '', cands: r.cands, sure: r.confidence === 'strong' })));
   } catch (e) {
     setStatus(e.message || 'Something went wrong. Try again.', { error: true });
   } finally {
@@ -641,6 +735,45 @@ async function identify(canvas, { wide = false } = {}) {
     els.guide.classList.remove('captured');
     renderDock();
   }
+}
+
+async function showCardResult(res, count = true) {
+  if (count) countScan();
+  state.candidates = res.cands;
+  state.confidence = res.confidence;
+  setStatus('Getting prices…', { busy: true });
+  await openCard(res.cands[0].id);
+  idleStatus();
+  if (state.confidence === 'guess') openCardChooser(true);
+}
+
+/** Ask Claude or ChatGPT what is in the picture. */
+async function scanWithAI(canvas, wide) {
+  setStatus(wide ? `${aiName()} is looking at everything…` : `${aiName()} is reading the card…`, { busy: true });
+  const items = await aiItems(canvas, wide);
+  if (!items.length) { setStatus(wide ? 'No Pokémon cards or sealed product found. Try more light or get closer.' : "That doesn't look like a Pokémon card. Try again.", { error: true }); return; }
+  countScan();
+  if (items.length === 1) return showSingle(items[0]);
+  setStatus(`Matching ${items.length} items…`, { busy: true });
+  const entries = await Promise.all(items.map(async (it) => {
+    const e = { kind: it.kind, label: it.name || 'Unknown item', query: [it.name, it.set_name, it.product_type].filter(Boolean).join(' '), cands: [], sure: false };
+    try {
+      if (it.kind === 'sealed') { e.cands = await findSealed({ name: it.name, set: it.set_name, type: it.product_type }); e.sure = sealedConfidence(e.cands) === 'strong'; }
+      else { e.cands = await findCandidates(hintsFromItem(it)); e.sure = confidenceOf(e.cands) === 'strong'; }
+    } catch { /* leave unmatched */ }
+    return e;
+  }));
+  return showBatch(entries);
+}
+
+/** Last resort when the picture index can't be loaded: read the card's text only. */
+async function scanByTextOnly(canvas) {
+  setStatus('Reading card…', { busy: true });
+  const t = await ocrCard(canvas);
+  const hints = { names: nameTokens(t.top).concat(nameTokens(t.full).slice(0, 1)), num: parseNumber(t.bottom) || parseNumber(t.full), text: t.top + ' ' + t.full };
+  const cands = await findCandidates(hints);
+  if (!cands.length) { setStatus('No match. Move closer, cut the glare, or use Search.', { error: true }); return; }
+  return showCardResult({ cands, confidence: confidenceOf(cands) });
 }
 
 function countScan() {
@@ -663,23 +796,14 @@ async function showSingle(it) {
   }
   const cands = await findCandidates(hintsFromItem(it));
   if (!cands.length) { setStatus(`Read "${it.name} ${it.number}" but couldn't match it. Try Search.`, { error: true }); return; }
-  state.candidates = cands;
-  state.confidence = confidenceOf(cands);
-  setStatus('Getting prices…', { busy: true });
-  await openCard(cands[0].id);
-  idleStatus();
-  if (state.confidence === 'guess') openCardChooser(true);
+  return showCardResult({ cands, confidence: confidenceOf(cands) }, false);
 }
 
-function onScan() {
+async function onScan() {
   if (!state.stream) { startCamera(); return; }
   if (state.busy || !els.video.videoWidth) return;
-  if (state.mode === 'multi') {
-    if (!activeAI()) return renderMode();
-    grabFull().then((c) => identify(c, { wide: true }));
-  } else {
-    identify(grabGuide());
-  }
+  if (state.mode === 'card') scan(grabFrame(), { guide: guideInFrame() });
+  else scan(await grabFull());
 }
 
 function scanFile(file) {
@@ -696,9 +820,8 @@ function scanFile(file) {
     const c = document.createElement('canvas');
     const k = Math.min(1, 3000 / Math.max(img.width, img.height));
     c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
-    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    // A photo can hold several cards or a sealed box, so let the AI see all of it when it's available.
-    identify(c, { wide: !!activeAI() });
+    c.getContext('2d', { willReadFrequently: true }).drawImage(img, 0, 0, c.width, c.height);
+    scan(c);
   };
   img.onerror = () => setStatus("That file couldn't be opened as an image.", { error: true });
   img.src = url;
@@ -726,13 +849,12 @@ function setMode(mode) {
 }
 
 function renderMode() {
+  if (!['card', 'multi', 'sealed'].includes(state.mode)) state.mode = 'card';
   els.modes.querySelectorAll('button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.mode === state.mode)));
-  const multi = state.mode === 'multi';
-  els.stage.classList.toggle('multi', multi);
+  const single = state.mode === 'card';
+  els.stage.classList.toggle('multi', !single);
   els.guide.hidden = !state.stream;
-  els.needsAi.hidden = !(multi && !activeAI() && els.still.hidden);
-  els.aiTip.hidden = !!activeAI();
-  els.helpBtn.hidden = !state.stream || multi;
+  els.helpBtn.hidden = !state.stream || !single;
 }
 
 /* ---------- result sheet ---------- */
@@ -946,7 +1068,7 @@ function renderDock() {
     els.skipBtn.textContent = state.confidence === 'demo' ? 'Close' : 'Skip';
   } else {
     els.scanBtn.disabled = state.busy;
-    const label = state.mode === 'multi' ? 'Scan all' : 'Scan';
+    const label = { multi: 'Scan all', sealed: 'Scan box' }[state.mode] || 'Scan';
     els.scanBtn.innerHTML = state.busy ? '<span class="spin"></span> Scanning…'
       : state.stream ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg> ${label}`
       : 'Start camera';
@@ -1037,7 +1159,7 @@ async function runSearch(q) {
     } else {
       const num = parseNumber(q) || (q.match(/\b\d{1,3}\b/) ? { prefix: '', n: parseInt(q.match(/\b(\d{1,3})\b/)[1], 10), total: null } : null);
       const namePart = q.replace(/[A-Z]{0,4}\d{1,3}\s*\/\s*[A-Z]{0,4}\d{1,3}/gi, ' ').replace(/\b\d{1,3}\b/g, ' ').replace(/#/g, ' ').trim();
-      cands = await findCandidates({ exactNames: namePart ? [namePart] : [], names: nameTokens(namePart), num, text: namePart });
+      cands = await findCandidates({ exactNames: namePart ? [namePart] : [], names: nameTokens(namePart), num, text: namePart }, 40);
       if (!cands.length) { els.searchNote.textContent = `No cards found for "${q}". Check the spelling, or try just the name.`; return; }
       els.searchList.innerHTML = cands.map((c) => cardRow(c, false)).join('');
     }
@@ -1061,20 +1183,16 @@ els.searchList.addEventListener('click', async (ev) => {
 
 /* ---------- multi-scan results ---------- */
 
-async function showBatch(items) {
-  setStatus(`Matching ${items.length} items…`, { busy: true });
-  const batch = await Promise.all(items.map(async (ai) => {
-    const b = { ai, kind: ai.kind, cands: [], card: null, product: null, printing: null, include: false };
+/** entries: [{ kind: 'card'|'sealed', label, query, cands, sure }] with cands already ranked. */
+async function showBatch(entries) {
+  setStatus(`Getting prices for ${entries.length} items…`, { busy: true });
+  const batch = await Promise.all(entries.map(async (e) => {
+    const b = { ...e, card: null, product: null, printing: null, include: false };
     try {
-      if (ai.kind === 'sealed') {
-        b.cands = await findSealed({ name: ai.name, set: ai.set_name, type: ai.product_type });
-        b.product = b.cands[0] || null;
-      } else {
-        b.cands = await findCandidates(hintsFromItem(ai));
-        if (b.cands.length) {
-          b.card = await getJSON(`${API}/cards/${encodeURIComponent(b.cands[0].id)}`);
-          b.printing = printingsOf(b.card)[0] || null;
-        }
+      if (e.kind === 'sealed') b.product = e.cands[0] || null;
+      else if (e.cands.length) {
+        b.card = await getJSON(`${API}/cards/${encodeURIComponent(e.cands[0].id)}`);
+        b.printing = printingsOf(b.card)[0] || null;
       }
     } catch { /* leave unmatched */ }
     b.include = !!(b.card || b.product);
@@ -1094,8 +1212,10 @@ function renderBatch() {
   const chosen = b.filter((x) => x.include);
   const total = chosen.reduce((s, x) => s + (batchValue(x) ?? 0), 0);
   els.batchTitle.textContent = `Found ${b.length} item${b.length === 1 ? '' : 's'}`;
+  const unsure = b.filter((x) => (x.card || x.product) && !x.sure).length;
   els.batchNote.textContent = matched < b.length
     ? `${b.length - matched} couldn't be matched. Tap them to search. Untick anything you don't want.`
+    : unsure ? `${unsure} marked "Check" might be a different printing. Tap to fix. Untick anything you don't want.`
     : 'Untick anything you don\'t want. Tap an item to fix the match.';
   els.batchList.innerHTML = b.map((x, i) => {
     const ok = x.card || x.product;
@@ -1105,14 +1225,14 @@ function renderBatch() {
     if (x.product) sub = `<span class="s">Sealed · ${esc(x.product.group.replace(/^[A-Z0-9]+:\s*/, ''))}</span>`;
     else if (x.card) {
       const pr = printingsOf(x.card);
-      sub = `<span class="s">${esc(x.card.set?.name || '')} · #${esc(numberText(x.card))}</span>` +
+      sub = `<span class="s">${x.sure ? '' : '<b class="miss">Check · </b>'}${esc(x.card.set?.name || '')} · #${esc(numberText(x.card))}</span>` +
         (pr.length > 1 ? `<select data-i="${i}" aria-label="Printing for ${esc(x.card.name)}">${pr.map((p) => `<option value="${esc(p)}"${p === x.printing ? ' selected' : ''}>${esc(printingLabel(p))}</option>`).join('')}</select>` : '');
-    } else sub = `<span class="miss">No match for “${esc(x.ai.name || 'unknown')}”. Tap to search.</span>`;
+    } else sub = `<span class="miss">No match${x.query ? ` for “${esc(x.label)}”` : ''}. Tap to search.</span>`;
     const val = batchValue(x);
     return `<div class="list-row batch-row${x.include ? '' : ' off'}">
-      <button type="button" class="check" role="checkbox" aria-checked="${x.include}" data-act="toggle" data-i="${i}" ${ok ? '' : 'disabled'} aria-label="Include ${esc((x.card || x.product)?.name || x.ai.name)}"><span></span></button>
+      <button type="button" class="check" role="checkbox" aria-checked="${x.include}" data-act="toggle" data-i="${i}" ${ok ? '' : 'disabled'} aria-label="Include ${esc((x.card || x.product)?.name || x.label)}"><span></span></button>
       <span data-act="fix" data-i="${i}" style="cursor:pointer">${img}</span>
-      <span class="t" data-act="fix" data-i="${i}" style="cursor:pointer"><span class="n">${esc((x.card || x.product)?.name || x.ai.name || 'Unknown item')}</span>${sub}</span>
+      <span class="t" data-act="fix" data-i="${i}" style="cursor:pointer"><span class="n">${esc((x.card || x.product)?.name || x.label || 'Unknown item')}</span>${sub}</span>
       <span class="v"><span class="usd mono">${ok ? (val != null ? usd(val) : 'No price') : ''}</span></span>
     </div>`;
   }).join('');
@@ -1129,11 +1249,11 @@ els.batchList.addEventListener('click', (ev) => {
   // Fix the match: pick from the alternatives, or search when nothing matched.
   if (!x.cands.length) {
     closePanel(els.batchPanel);
-    openSearch(x.kind === 'sealed' ? 'sealed' : 'card', [x.ai.name, x.ai.set_name, x.ai.product_type].filter(Boolean).join(' '));
+    openSearch(x.kind === 'sealed' ? 'sealed' : 'card', x.query);
     return;
   }
   openChooser({
-    note: `Which one is it? We read “${[x.ai.name, x.ai.number].filter(Boolean).join(' ')}”.`,
+    note: 'Which one is it? Tap the one that matches.',
     html: x.kind === 'sealed'
       ? x.cands.map((p) => sealedRow(p, x.product && p.pid === x.product.pid)).join('')
       : x.cands.map((c) => cardRow(c, x.card && c.id === x.card.id)).join(''),
@@ -1141,6 +1261,7 @@ els.batchList.addEventListener('click', (ev) => {
       if (x.kind === 'sealed') x.product = x.cands.find((p) => String(p.pid) === id);
       else { x.card = await getJSON(`${API}/cards/${encodeURIComponent(id)}`); x.printing = printingsOf(x.card)[0] || null; }
       x.include = true;
+      x.sure = true;
       renderBatch();
     },
   });
@@ -1396,7 +1517,7 @@ function openSettings() {
   els.openaiKey.value = openaiKey();
   els.openaiModel.value = storageGet('pokescan.openaiModel', '');
   els.soundOpt.checked = soundOn();
-  const prov = storageGet('pokescan.provider', null) || (claudeKey() ? 'claude' : openaiKey() ? 'openai' : 'claude');
+  const prov = storageGet('pokescan.provider', null) || (claudeKey() ? 'claude' : openaiKey() ? 'openai' : 'ocr');
   els.settings.querySelectorAll('input[name=provider]').forEach((r) => { r.checked = r.value === prov; });
   els.settings.querySelectorAll('input[name=source]').forEach((r) => { r.checked = r.value === source(); });
   els.settingsErr.hidden = true;
@@ -1418,7 +1539,7 @@ els.settings.querySelector('form').addEventListener('submit', (e) => {
   const missing = (p === 'claude' && !els.apiKey.value.trim()) || (p === 'openai' && !els.openaiKey.value.trim());
   if (missing) {
     e.preventDefault();
-    els.settingsErr.textContent = `Paste your ${p === 'claude' ? 'Anthropic' : 'OpenAI'} API key, or choose On-device.`;
+    els.settingsErr.textContent = `Paste your ${p === 'claude' ? 'Anthropic' : 'OpenAI'} API key, or choose Built-in only.`;
     els.settingsErr.hidden = false;
   }
 });
@@ -1442,7 +1563,7 @@ els.settings.addEventListener('close', () => {
 /* ---------- wiring ---------- */
 
 els.scanBtn.addEventListener('click', onScan);
-els.searchBtn.addEventListener('click', () => openSearch(state.mode === 'multi' ? 'sealed' : state.searchKind));
+els.searchBtn.addEventListener('click', () => openSearch(state.mode === 'sealed' ? 'sealed' : state.mode === 'card' ? 'card' : state.searchKind));
 els.searchPanel.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setSearchKind(b.dataset.kind)));
 els.searchForm.addEventListener('submit', (e) => { e.preventDefault(); els.searchInput.blur(); runSearch(els.searchInput.value); });
 els.fileInput.addEventListener('change', () => { scanFile(els.fileInput.files[0]); els.fileInput.value = ''; });
@@ -1454,9 +1575,6 @@ els.batchRescan.addEventListener('click', () => { closePanel(els.batchPanel); ba
 els.stripMain.addEventListener('click', () => { renderBinder(); openPanel(els.binderPanel); });
 els.helpBtn.addEventListener('click', () => setHelp(!els.guide.classList.contains('help')));
 els.modes.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
-els.needsAiSetup.addEventListener('click', openSettings);
-els.aiTipBtn.addEventListener('click', openSettings);
-els.needsAiSearch.addEventListener('click', () => openSearch('sealed'));
 els.settingsBtn.addEventListener('click', openSettings);
 els.lightbox.addEventListener('click', () => { els.lightbox.hidden = true; });
 els.demoBtn.addEventListener('click', async () => {
