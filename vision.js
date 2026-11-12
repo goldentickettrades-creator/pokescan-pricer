@@ -38,7 +38,7 @@ function getIndex() {
         for (let j = 16; j < 32; j++) n += pop32(words[k * REC_WORDS + j]);
         maskBits[k] = Math.max(n, 1);
       }
-      return { cards, sets, words, maskBits, n: cards.length };
+      return { cards, sets, words, maskBits, n: cards.length, byId: new Map(cards.map((c, i) => [c.id, i])) };
     })().catch((e) => { indexPromise = null; throw e; });
   }
   return indexPromise;
@@ -360,9 +360,9 @@ function readingOrder(rects) {
  * Card-shaped objects in a photo, in reading order: loose cards on a plain surface, or cards in a binder page
  * with visible gaps. (Cards that touch are handled in recognizeMany, which needs the picture index to split them.)
  */
-function detectCards(src, opts) {
+function detectCards(src, { modes = ['ring', 'bright'], ...opts } = {}) {
   const out = [];
-  for (const mode of ['ring', 'bright']) {
+  for (const mode of modes) {
     for (const r of detectBlobs(src, { ...opts, mode })) if (isCardShaped(r) && !out.some((o) => sameSpot(o, r))) out.push(r);
   }
   return readingOrder(out);

@@ -9,7 +9,7 @@ const els = {
   app: $('#app'), stage: $('#stage'), video: $('#video'), still: $('#still'), guide: $('#guide'),
   stageEmpty: $('#stageEmpty'), demoBtn: $('#demoBtn'),
   modes: $('#modes'),
-  statusPill: $('#statusPill'), helpBtn: $('#helpBtn'),
+  statusPill: $('#statusPill'), liveLayer: $('#liveLayer'),
   sheet: $('#sheet'), sheetBody: $('#sheetBody'),
   strip: $('#strip'), stripMain: $('#stripMain'), stripLabel: $('#stripLabel'), stripTotal: $('#stripTotal'), undoBtn: $('#undoBtn'),
   dockReady: $('#dockReady'), dockResult: $('#dockResult'), scanBtn: $('#scanBtn'), searchBtn: $('#searchBtn'),
@@ -27,7 +27,7 @@ const state = {
   stream: null,
   busy: false,
   saving: false,
-  mode: storageGet('pokescan.mode', 'card'),   // 'card' | 'multi' | 'sealed'
+  mode: storageGet('pokescan.mode', 'live') === 'sealed' ? 'sealed' : 'live',   // 'live' | 'sealed'
   card: null,            // full TCGdex card on the sheet
   sealed: null,          // sealed product on the sheet
   printing: null,        // chosen printing key, or null when the person still has to choose
@@ -81,6 +81,33 @@ function activeAI() {
 }
 const aiName = () => ({ claude: 'Claude', openai: 'ChatGPT' }[activeAI()] || '');
 
+/**
+ * A card's full details and prices from TCGdex, fetched once per card per visit.
+ * Live scanning can ask for a whole binder page at once, so requests go out a few at a time and failed ones
+ * are retried (the service turns away bursts).
+ */
+const cardCache = new Map();
+const cardQueue = [];
+let cardActive = 0;
+function getCard(id) {
+  if (!cardCache.has(id)) {
+    const p = new Promise((resolve, reject) => { cardQueue.push({ id, resolve, reject, tries: 0 }); pumpCards(); });
+    p.catch(() => cardCache.delete(id));
+    cardCache.set(id, p);
+  }
+  return cardCache.get(id);
+}
+function pumpCards() {
+  while (cardActive < 3 && cardQueue.length) {
+    const job = cardQueue.shift();
+    cardActive++;
+    getJSON(`${API}/cards/${encodeURIComponent(job.id)}`).then(job.resolve, (e) => {
+      if (++job.tries >= 4) return job.reject(e);
+      setTimeout(() => { cardQueue.push(job); pumpCards(); }, 400 * job.tries * job.tries);
+    }).finally(() => { cardActive--; pumpCards(); });
+  }
+}
+
 async function getJSON(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`The price database returned an error (${r.status}). Try again in a moment.`);
@@ -94,7 +121,7 @@ function setStatus(msg, { busy = false, error = false } = {}) {
 }
 function idleStatus() {
   if (!state.stream) return setStatus('');
-  setStatus({ multi: 'Get all the cards in view (table or binder page), then Scan all.', sealed: 'Fill the view with the front of the box or pack.' }[state.mode] || 'Fit the whole card inside the frame.');
+  setStatus(state.mode === 'sealed' ? 'Fill the view with the front of the box or pack.' : 'Point at your cards. Prices appear on them.');
 }
 
 const imgUrl = (base, q = 'high') => (base ? `${base}/${q}.webp` : '');
@@ -160,9 +187,8 @@ async function startCamera() {
     els.still.hidden = true;
     els.video.hidden = false;
     storageSet('pokescan.camOk', true);
-    // Show the name/number zones for the first couple of scans, then keep the frame calm.
-    setHelp(state.scans < 2);
     idleStatus();
+    liveStart();
   } catch (e) {
     const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
     setStatus(denied ? 'Camera blocked. Allow it in your browser settings, or use Upload.' : 'No camera found. Use Upload or Search.', { error: true });
@@ -203,11 +229,6 @@ document.addEventListener('visibilitychange', () => {
     if (els.still.hidden) startCamera();
   }
 });
-
-function setHelp(on) {
-  els.guide.classList.toggle('help', on);
-  els.helpBtn.setAttribute('aria-pressed', String(on));
-}
 
 /** The whole view at the best resolution available: a real photo where the browser allows it, else the video frame. */
 async function grabFull() {
@@ -644,17 +665,6 @@ function cropCanvas(src, x, y, w, h) {
   return c;
 }
 
-/** Recognise the single card inside the guide: by the guide itself, and by the card's real outline if it can be found. */
-async function recognizeGuideCard(index, frame, g) {
-  const views = [rectify(frame, { cx: g.x + g.w / 2, cy: g.y + g.h / 2, w: g.w, h: g.h, angle: 0 })];
-  const pad = 0.16;
-  const rx = Math.max(0, g.x - g.w * pad), ry = Math.max(0, g.y - g.h * pad);
-  const region = cropCanvas(frame, rx, ry, g.w * (1 + 2 * pad), g.h * (1 + 2 * pad));
-  const found = detectCards(region, { minFrac: 0.2 }).sort((a, b) => b.w * b.h - a.w * a.h)[0];
-  if (found && Math.abs(found.angle) < 0.5) views.push(rectify(frame, { ...found, cx: found.cx + rx, cy: found.cy + ry }));
-  return recognizeCard(index, views);
-}
-
 /** Recognise whatever cards are in a photo that has no guide (an upload, or Multi mode). */
 async function recognizePhoto(index, frame) {
   const many = await recognizeMany(index, frame, (i, n) => setStatus(n > 1 ? `Found ${n} cards. Matching ${i} of ${n}…` : 'Matching the card…', { busy: true }));
@@ -698,23 +708,8 @@ async function scan(frame, { guide = null } = {}) {
       return;
     }
 
-    // ----- one card in the guide -----
-    if (mode === 'card' && guide) {
-      let res = null;
-      if (index) res = await recognizeGuideCard(index, frame, guide);
-      if (res?.confidence === 'strong') return await showCardResult(res);
-      if (ai) {
-        try { return await scanWithAI(cropCanvas(frame, guide.x - guide.w * 0.03, guide.y - guide.h * 0.03, guide.w * 1.06, guide.h * 1.06), false); }
-        catch (e) { if (!res?.cands.length) throw e; }
-      }
-      if (res?.cands.length) return await showCardResult(res);
-      if (!index) return await scanByTextOnly(cropCanvas(frame, guide.x, guide.y, guide.w, guide.h));
-      setStatus('No match. Line the card up with the corners, cut the glare, and try again.', { error: true });
-      return;
-    }
-
     // ----- several cards, or an uploaded photo -----
-    if (ai && (mode === 'multi' || !index)) return await scanWithAI(frame, true);
+    if (ai && !index) return await scanWithAI(frame, true);
     if (!index) return await scanByTextOnly(frame);
     const results = await recognizePhoto(index, frame);
     if (!results.length) {
@@ -778,7 +773,6 @@ async function scanByTextOnly(canvas) {
 
 function countScan() {
   state.scans += 1; storageSet('pokescan.scans', state.scans);
-  if (state.scans >= 2) setHelp(false);
 }
 
 /** One item from the AI: open its result sheet. */
@@ -802,7 +796,7 @@ async function showSingle(it) {
 async function onScan() {
   if (!state.stream) { startCamera(); return; }
   if (state.busy || !els.video.videoWidth) return;
-  if (state.mode === 'card') scan(grabFrame(), { guide: guideInFrame() });
+  if (state.mode === 'live') liveReview();   // cards are recognised continuously; the button adds what's in view
   else scan(await grabFull());
 }
 
@@ -830,6 +824,8 @@ function scanFile(file) {
 /** After a result is dismissed, go back to whatever the person was scanning with. */
 function backToCamera() {
   closeSheet();
+  live.openKey = null;
+  live.reviewing = [];
   if (!state.stream) {
     els.still.hidden = true;
     if (storageGet('pokescan.camOk', false)) startCamera();
@@ -845,22 +841,21 @@ function setMode(mode) {
   storageSet('pokescan.mode', mode);
   renderMode();
   idleStatus();
-  renderDock();
+  liveRender();
+  if (state.stream && mode === 'live') liveStart();
 }
 
 function renderMode() {
-  if (!['card', 'multi', 'sealed'].includes(state.mode)) state.mode = 'card';
   els.modes.querySelectorAll('button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.mode === state.mode)));
-  const single = state.mode === 'card';
-  els.stage.classList.toggle('multi', !single);
+  // The corner marks only show in Live mode while nothing has been recognised (see liveRender).
+  els.stage.classList.toggle('multi', state.mode !== 'live');
   els.guide.hidden = !state.stream;
-  els.helpBtn.hidden = !state.stream || !single;
 }
 
 /* ---------- result sheet ---------- */
 
 async function openCard(id, { demo = false } = {}) {
-  const card = await getJSON(`${API}/cards/${encodeURIComponent(id)}`);
+  const card = await getCard(id);
   state.card = card;
   state.sealed = null;
   const printings = printingsOf(card);
@@ -1067,8 +1062,15 @@ function renderDock() {
     els.addBtn.textContent = state.confidence === 'demo' ? 'Demo card' : needPrinting ? 'Choose printing' : 'Add & next';
     els.skipBtn.textContent = state.confidence === 'demo' ? 'Close' : 'Skip';
   } else {
+    if (state.mode === 'live' && state.stream && !state.busy) {
+      // Live: nothing to press to scan. The button collects whatever is in view.
+      const { open, text } = liveTotals();
+      els.scanBtn.disabled = !open.length;
+      els.scanBtn.textContent = open.length ? `Add ${open.length} · ${text}` : live.tracks.length ? 'All added' : 'Looking for cards…';
+      return;
+    }
     els.scanBtn.disabled = state.busy;
-    const label = { multi: 'Scan all', sealed: 'Scan box' }[state.mode] || 'Scan';
+    const label = 'Scan box';
     els.scanBtn.innerHTML = state.busy ? '<span class="spin"></span> Scanning…'
       : state.stream ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg> ${label}`
       : 'Start camera';
@@ -1191,7 +1193,7 @@ async function showBatch(entries) {
     try {
       if (e.kind === 'sealed') b.product = e.cands[0] || null;
       else if (e.cands.length) {
-        b.card = await getJSON(`${API}/cards/${encodeURIComponent(e.cands[0].id)}`);
+        b.card = await getCard(e.cands[0].id);
         b.printing = printingsOf(b.card)[0] || null;
       }
     } catch { /* leave unmatched */ }
@@ -1259,7 +1261,7 @@ els.batchList.addEventListener('click', (ev) => {
       : x.cands.map((c) => cardRow(c, x.card && c.id === x.card.id)).join(''),
     onPick: async (id) => {
       if (x.kind === 'sealed') x.product = x.cands.find((p) => String(p.pid) === id);
-      else { x.card = await getJSON(`${API}/cards/${encodeURIComponent(id)}`); x.printing = printingsOf(x.card)[0] || null; }
+      else { x.card = await getCard(id); x.printing = printingsOf(x.card)[0] || null; }
       x.include = true;
       x.sure = true;
       renderBatch();
@@ -1283,6 +1285,7 @@ function addBatch() {
   const anyNew = adds.some((a) => a.isNew);
   closePanel(els.batchPanel);
   celebrate(`Added ${chosen.length} item${chosen.length === 1 ? '' : 's'} · ${usd(total)}`, anyNew, adds);
+  liveMarkAdded('review');
   backToCamera();
 }
 
@@ -1381,6 +1384,7 @@ function addAndNext() {
   flyToStrip(els.sheetBody.querySelector('.thumb img'));
   celebrate(`${add.isNew ? 'New find · ' : ''}Added · ${add.entry.name} ×${add.entry.qty}`, add.isNew, [add]);
   state.saving = false;
+  liveMarkAdded('open');
   backToCamera();
 }
 
@@ -1563,7 +1567,7 @@ els.settings.addEventListener('close', () => {
 /* ---------- wiring ---------- */
 
 els.scanBtn.addEventListener('click', onScan);
-els.searchBtn.addEventListener('click', () => openSearch(state.mode === 'sealed' ? 'sealed' : state.mode === 'card' ? 'card' : state.searchKind));
+els.searchBtn.addEventListener('click', () => openSearch(state.mode === 'sealed' ? 'sealed' : state.searchKind));
 els.searchPanel.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setSearchKind(b.dataset.kind)));
 els.searchForm.addEventListener('submit', (e) => { e.preventDefault(); els.searchInput.blur(); runSearch(els.searchInput.value); });
 els.fileInput.addEventListener('change', () => { scanFile(els.fileInput.files[0]); els.fileInput.value = ''; });
@@ -1573,7 +1577,6 @@ els.undoBtn.addEventListener('click', undoAdd);
 els.batchAdd.addEventListener('click', addBatch);
 els.batchRescan.addEventListener('click', () => { closePanel(els.batchPanel); backToCamera(); });
 els.stripMain.addEventListener('click', () => { renderBinder(); openPanel(els.binderPanel); });
-els.helpBtn.addEventListener('click', () => setHelp(!els.guide.classList.contains('help')));
 els.modes.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 els.settingsBtn.addEventListener('click', openSettings);
 els.lightbox.addEventListener('click', () => { els.lightbox.hidden = true; });
@@ -1606,9 +1609,3 @@ renderMode();
 renderDock();
 setStatus('');
 getSets().catch(() => {});
-// Open straight into the camera if the person already allowed it here before.
-(async () => {
-  let granted = false;
-  try { granted = (await navigator.permissions?.query({ name: 'camera' }))?.state === 'granted'; } catch { /* unsupported */ }
-  if (granted || storageGet('pokescan.camOk', false)) startCamera();
-})();
