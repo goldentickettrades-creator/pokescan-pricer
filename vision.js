@@ -103,9 +103,9 @@ const JITTER_INSETS = [-0.03, 0, 0.03];
 const JITTER_SHIFTS = [-0.025, 0, 0.025];
 
 /** Fingerprints of a card view at slightly different crops, to forgive imperfect framing. */
-function jitterHashes(view, flip, full = true) {
+function jitterHashes(view, flip, full = true, wide = false) {
   const out = [];
-  const insets = full ? JITTER_INSETS : [0], shifts = full ? JITTER_SHIFTS : [0];
+  const insets = full ? JITTER_INSETS : [0], shifts = !full ? [0] : wide ? JITTER_SHIFTS.map((x) => x * 2) : JITTER_SHIFTS;
   for (const s of insets) for (const dx of shifts) for (const dy of shifts) {
     out.push(cardHash(view.canvas, view.x + view.w * (s + dx), view.y + view.h * (s + dy), view.w * (1 - 2 * s), view.h * (1 - 2 * s), flip));
   }
@@ -215,11 +215,13 @@ function minAreaRect(hull) {
 }
 
 /**
- * Find solid objects standing out from the background of a photo.
- * Returns rectangles in `src` pixels: { cx, cy, w (short side), h (long side), angle, fit, frac }.
+ * Find solid shapes in a photo. Two ways of telling "thing" from "not thing":
+ *   mode 'ring'   - differs in colour from the surface seen around the edge of the photo (loose cards on a table)
+ *   mode 'bright' - brighter than the dark material between cards (binder pages, dark playmats)
+ * Returns rectangles in `src` pixels: { cx, cy, w (short side), h (long side), angle, fit, frac, box }.
  */
-function detectBlobs(src, { minFrac = 0.012 } = {}) {
-  const k = Math.min(1, 520 / Math.max(src.width, src.height));
+function detectBlobs(src, { minFrac = 0.012, mode = 'ring', maxSide = 1024 } = {}) {
+  const k = Math.min(1, maxSide / Math.max(src.width, src.height));
   const w = Math.max(16, Math.round(src.width * k)), h = Math.max(16, Math.round(src.height * k));
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
@@ -228,32 +230,35 @@ function detectBlobs(src, { minFrac = 0.012 } = {}) {
   ctx.drawImage(src, 0, 0, w, h);
   const d = ctx.getImageData(0, 0, w, h).data;
 
-  // Background colour: the median of each edge strip, blended across the photo so uneven lighting is tolerated.
-  const ring = Math.max(2, Math.round(Math.min(w, h) * 0.03));
-  const strips = { top: [[], [], []], bottom: [[], [], []], left: [[], [], []], right: [[], [], []] };
-  const put = (s, i) => { s[0].push(d[i]); s[1].push(d[i + 1]); s[2].push(d[i + 2]); };
-  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
-    const i = (y * w + x) * 4;
-    if (y < ring) put(strips.top, i); else if (y >= h - ring) put(strips.bottom, i);
-    if (x < ring) put(strips.left, i); else if (x >= w - ring) put(strips.right, i);
-  }
-  const med = (a) => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
-  const T = strips.top.map(med), B = strips.bottom.map(med), L = strips.left.map(med), R = strips.right.map(med);
-
-  // How different each pixel is from the background, then an automatic (Otsu) cut-off.
-  const diff = new Uint8Array(w * h);
-  const hist = new Uint32Array(256);
-  for (let y = 0, p = 0; y < h; y++) {
-    const fy = y / (h - 1);
-    for (let x = 0; x < w; x++, p++) {
-      const fx = x / (w - 1), i = p * 4;
-      const br = (T[0] * (1 - fy) + B[0] * fy + L[0] * (1 - fx) + R[0] * fx) / 2;
-      const bg = (T[1] * (1 - fy) + B[1] * fy + L[1] * (1 - fx) + R[1] * fx) / 2;
-      const bb = (T[2] * (1 - fy) + B[2] * fy + L[2] * (1 - fx) + R[2] * fx) / 2;
-      const v = Math.min(255, Math.round(Math.hypot(d[i] - br, d[i + 1] - bg, d[i + 2] - bb) / 1.732));
-      diff[p] = v; hist[v]++;
+  // One number per pixel saying how "thing-like" it is, then an automatic (Otsu) cut-off.
+  const val = new Uint8Array(w * h);
+  if (mode === 'bright') {
+    for (let p = 0, i = 0; p < w * h; p++, i += 4) val[p] = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+  } else {
+    // Background colour: the median of each edge strip, blended across the photo so uneven lighting is tolerated.
+    const ring = Math.max(2, Math.round(Math.min(w, h) * 0.03));
+    const strips = { top: [[], [], []], bottom: [[], [], []], left: [[], [], []], right: [[], [], []] };
+    const put = (s, i) => { s[0].push(d[i]); s[1].push(d[i + 1]); s[2].push(d[i + 2]); };
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+      const i = (y * w + x) * 4;
+      if (y < ring) put(strips.top, i); else if (y >= h - ring) put(strips.bottom, i);
+      if (x < ring) put(strips.left, i); else if (x >= w - ring) put(strips.right, i);
+    }
+    const med = (a) => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
+    const T = strips.top.map(med), B = strips.bottom.map(med), L = strips.left.map(med), R = strips.right.map(med);
+    for (let y = 0, p = 0; y < h; y++) {
+      const fy = y / (h - 1);
+      for (let x = 0; x < w; x++, p++) {
+        const fx = x / (w - 1), i = p * 4;
+        const br = (T[0] * (1 - fy) + B[0] * fy + L[0] * (1 - fx) + R[0] * fx) / 2;
+        const bg = (T[1] * (1 - fy) + B[1] * fy + L[1] * (1 - fx) + R[1] * fx) / 2;
+        const bb = (T[2] * (1 - fy) + B[2] * fy + L[2] * (1 - fx) + R[2] * fx) / 2;
+        val[p] = Math.min(255, Math.round(Math.hypot(d[i] - br, d[i + 1] - bg, d[i + 2] - bb) / 1.732));
+      }
     }
   }
+  const hist = new Uint32Array(256);
+  for (let p = 0; p < w * h; p++) hist[val[p]]++;
   let sum = 0; for (let t = 0; t < 256; t++) sum += t * hist[t];
   let wB = 0, sumB = 0, maxVar = -1, thr = 32;
   for (let t = 0; t < 256; t++) {
@@ -263,11 +268,11 @@ function detectBlobs(src, { minFrac = 0.012 } = {}) {
     const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) * (mB - mF);
     if (v > maxVar) { maxVar = v; thr = t; }
   }
-  // Otsu splits "clearly card" from the rest; a card's border only needs to differ a little, so go lower.
-  thr = Math.max(12, Math.round(thr * 0.55));
+  // In 'ring' mode Otsu splits "clearly card" from the rest; a card's border only needs to differ a little, so go lower.
+  if (mode !== 'bright') thr = Math.max(12, Math.round(thr * 0.55));
 
   let mask = new Uint8Array(w * h);
-  for (let p = 0; p < w * h; p++) mask[p] = diff[p] > thr ? 1 : 0;
+  for (let p = 0; p < w * h; p++) mask[p] = val[p] > thr ? 1 : 0;
   const morph = (m, dilate) => {
     const o = new Uint8Array(w * h);
     for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
@@ -276,9 +281,27 @@ function detectBlobs(src, { minFrac = 0.012 } = {}) {
     }
     return o;
   };
-  // Close 1px gaps in card outlines.
-  mask = morph(morph(mask, true), false);
-  // Fill everything enclosed by an outline, so a card whose artwork matches the table is still one solid shape.
+  // Close 1px gaps in card outlines (not in 'bright' mode, where the thin dark gaps between cards are the signal).
+  if (mode !== 'bright') mask = morph(morph(mask, true), false);
+  else {
+    // A light table around a dark binder is "bright" too. Drop any big bright area that runs off the edge of the
+    // photo, otherwise it would count as an outline enclosing the whole binder.
+    const seen = new Uint8Array(w * h), q = new Int32Array(w * h);
+    const flood = (start) => {
+      let qh = 0, qt = 0;
+      q[qt++] = start; seen[start] = 1;
+      while (qh < qt) {
+        const p = q[qh++], x = p % w;
+        for (const n of [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p - w, p + w]) {
+          if (n >= 0 && n < w * h && mask[n] && !seen[n]) { seen[n] = 1; q[qt++] = n; }
+        }
+      }
+      if (qt > 0.08 * w * h) for (let i = 0; i < qt; i++) mask[q[i]] = 0;
+    };
+    for (let x = 0; x < w; x++) for (const p of [x, (h - 1) * w + x]) if (mask[p] && !seen[p]) flood(p);
+    for (let y = 0; y < h; y++) for (const p of [y * w, y * w + w - 1]) if (mask[p] && !seen[p]) flood(p);
+  }
+  // Fill everything enclosed by an outline, so a card whose artwork matches the background is still one solid shape.
   {
     const seen = new Uint8Array(w * h), q = new Int32Array(w * h);
     let qh = 0, qt = 0;
@@ -292,7 +315,7 @@ function detectBlobs(src, { minFrac = 0.012 } = {}) {
     }
     for (let p = 0; p < w * h; p++) if (!seen[p]) mask[p] = 1;
   }
-  // Open by 2px: removes specks and cuts thin bridges (shadows, wood grain) between neighbouring cards.
+  // Open by 2px: removes specks and cuts thin bridges (shadows, glare, wood grain) between neighbouring cards.
   mask = morph(morph(morph(morph(mask, false), false), true), true);
 
   // Connected regions.
@@ -326,15 +349,65 @@ function detectBlobs(src, { minFrac = 0.012 } = {}) {
   return rects;
 }
 
+const isCardShaped = (r) => r.fit >= 0.75 && Math.abs(r.w / r.h - CARD_ASPECT) <= 0.12;
+const sameSpot = (a, b) => Math.hypot(a.cx - b.cx, a.cy - b.cy) < 0.4 * Math.min(a.w, b.w);
+function readingOrder(rects) {
+  const rowH = rects.length ? Math.min(...rects.map((r) => r.h)) * 0.6 : 1;
+  return rects.sort((a, b) => (Math.abs(a.cy - b.cy) > rowH ? a.cy - b.cy : a.cx - b.cx));
+}
+
 /**
- * Find card-shaped objects in a photo, in reading order. Works best with cards on a plain surface with a
- * little space between them. (Two cards touching side by side have a card-like outline too; recognizeMany splits those.)
+ * Card-shaped objects in a photo, in reading order: loose cards on a plain surface, or cards in a binder page
+ * with visible gaps. (Cards that touch are handled in recognizeMany, which needs the picture index to split them.)
  */
 function detectCards(src, opts) {
-  const rects = detectBlobs(src, opts).filter((r) => r.fit >= 0.8 && Math.abs(r.w / r.h - CARD_ASPECT) <= 0.11);
-  const rowH = rects.length ? Math.min(...rects.map((r) => r.h)) * 0.6 : 1;
-  rects.sort((a, b) => (Math.abs(a.cy - b.cy) > rowH ? a.cy - b.cy : a.cx - b.cx));
-  return rects;
+  const out = [];
+  for (const mode of ['ring', 'bright']) {
+    for (const r of detectBlobs(src, { ...opts, mode })) if (isCardShaped(r) && !out.some((o) => sameSpot(o, r))) out.push(r);
+  }
+  return readingOrder(out);
+}
+
+/**
+ * Bigger solid shapes that could be several cards touching (a row or block in a binder).
+ * `card` is the typical card size seen elsewhere in the photo, if known.
+ */
+function detectGroups(src, card, taken) {
+  const out = [];
+  const cardArea = card ? card.w * card.h : 0;
+  for (const mode of ['ring', 'bright']) {
+    for (const r of detectBlobs(src, { mode })) {
+      if (r.fit < 0.6 || r.frac > 0.9) continue;
+      if (cardArea ? r.w * r.h < 1.5 * cardArea : isCardShaped(r)) continue;
+      if (taken.some((t) => sameSpot(t, r)) || out.some((o) => sameSpot(o, r))) continue;
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+/** Ways a block could be cut into a grid of cards, best fit first. Each entry is a list of card rectangles. */
+function gridSplits(r, card) {
+  // Axis A is the block's short side (direction r.angle), axis B its long side.
+  const ax = Math.cos(r.angle), ay = Math.sin(r.angle), bx = -ay, by = ax;
+  const options = [];
+  for (const upright of [true, false]) {          // card width runs along A, or along B
+    for (let na = 1; na <= 5; na++) for (let nb = 1; nb <= 5; nb++) {
+      if (na * nb < 2 || na * nb > 12) continue;
+      const cellA = r.w / na, cellB = r.h / nb;
+      const cw = upright ? cellA : cellB, ch = upright ? cellB : cellA;
+      let err = Math.abs(cw / ch - CARD_ASPECT) / CARD_ASPECT;
+      if (card) err += 0.5 * Math.abs(cw - card.w) / card.w + 0.5 * Math.abs(ch - card.h) / card.h;
+      if (err > (card ? 0.45 : 0.16)) continue;
+      const cells = [];
+      for (let j = 0; j < nb; j++) for (let i = 0; i < na; i++) {
+        const u = (i + 0.5) * cellA - r.w / 2, v = (j + 0.5) * cellB - r.h / 2;
+        cells.push({ cx: r.cx + u * ax + v * bx, cy: r.cy + u * ay + v * by, w: cw, h: ch, angle: upright ? r.angle : r.angle + Math.PI / 2 });
+      }
+      options.push({ err, cells });
+    }
+  }
+  return options.sort((p, q) => p.err - q.err).slice(0, 3).map((o) => o.cells);
 }
 
 /** Cut a rotated card rectangle out of `src`, upright, with a margin so nearby crops stay inside the picture. */
@@ -408,9 +481,10 @@ function scoreLocal(index, hints, dist, limit = 18) {
  * Picture distances for one view of a card. A quick pass over every card with three crops finds the
  * 300 closest, then all 27 crops are tried on just those.
  */
-function rankView(index, view, flip) {
-  const hashes = jitterHashes(view, flip);
-  const dist = imageRank(index, [hashes[4], hashes[13], hashes[22]]); // the centred crop at each inset
+function rankView(index, view, flip, wide = false) {
+  const hashes = jitterHashes(view, flip, true, wide);
+  // Quick pass: the centred crop at each inset, or (wide) the centre plus one step in each direction.
+  const dist = imageRank(index, wide ? [hashes[13], hashes[10], hashes[16], hashes[12], hashes[14]] : [hashes[4], hashes[13], hashes[22]]);
   const order = Array.from({ length: index.n }, (_, i) => i).sort((p, q) => dist[p] - dist[q]);
   let best = Infinity;
   for (let k = 0; k < 300 && k < order.length; k++) {
@@ -427,11 +501,12 @@ const MIN_TEXT_WIDTH = 700; // below this many pixels across, the collector numb
  * Recognise the card shown in one or more candidate views (e.g. the detected outline and the on-screen guide).
  * Returns { cands, confidence, d } where cands are ranked matches.
  */
-async function recognizeCard(index, views, { allowFlip = false, readText = true } = {}) {
+async function recognizeCard(index, views, { allowFlip = false, readText = true, wide = false, flip = null } = {}) {
   const ranked = views.map((view) => {
-    const up = rankView(index, view, false);
-    if (!allowFlip) return up;
-    const down = rankView(index, view, true);
+    if (flip !== null) return rankView(index, view, flip, wide);
+    const up = rankView(index, view, false, wide);
+    if (!allowFlip || up.best <= 0.2) return up;
+    const down = rankView(index, view, true, wide);
     return down.best < up.best ? down : up;
   });
   const dist = ranked[0].dist;
@@ -440,7 +515,7 @@ async function recognizeCard(index, views, { allowFlip = false, readText = true 
 
   // The picture alone settles it: one clear look-alike and no reprints to tell apart.
   if (verdict.decided && verdict.ties.length === 1) {
-    return { cands: scoreLocal(index, null, dist), confidence: 'strong', d: verdict.best.d };
+    return { cands: scoreLocal(index, null, dist), confidence: 'strong', d: verdict.best.d, flip: ranked[0].flip };
   }
   // Otherwise read the text, from whichever view lined up best with the winning picture.
   let hints = null;
@@ -459,33 +534,85 @@ async function recognizeCard(index, views, { allowFlip = false, readText = true 
   }
   const [a, b2] = cands;
   const confidence = a && a.score >= 9 && (!b2 || a.score - b2.score >= 1.5) ? 'strong' : 'guess';
-  return { cands, confidence, d: verdict.best.d, sameArt: verdict.decided };
+  return { cands, confidence, d: verdict.best.d, sameArt: verdict.decided, flip: bestV.flip };
 }
 
+const MATCH_OK = 0.26; // a found shape counts as a card only if some card's picture is at least this close
+
 /**
- * Recognise every card found in a photo. Returns [{ cands, confidence }] in reading order.
+ * Recognise every card found in a photo. Returns [{ cands, confidence, rect }] in reading order.
+ * Shapes are proposed generously (loose cards, binder pockets, blocks of touching cards) and kept only when
+ * they actually look like a known card, so glare patches and empty pockets drop out.
  * Text is not read here: with several cards in view the collector numbers are too small, so reprints that
  * share artwork come back as a best guess for the person to confirm.
  */
 async function recognizeMany(index, frame, onProgress) {
-  const rects = detectCards(frame);
-  const out = [];
-  for (let i = 0; i < rects.length; i++) {
-    onProgress?.(i + 1, rects.length);
-    await new Promise((r) => setTimeout(r)); // let the status line repaint
-    const r = rects[i];
-    const res = await recognizeCard(index, [rectify(frame, r)], { allowFlip: true, readText: false });
-    if (res.d > 0.27) {
-      // Two cards lying edge to edge look like one wide card: try each half.
-      const ax = Math.cos(r.angle + Math.PI / 2), ay = Math.sin(r.angle + Math.PI / 2);
-      const halves = [-1, 1].map((s) => ({ cx: r.cx + s * ax * r.h / 4, cy: r.cy + s * ay * r.h / 4, w: r.h / 2, h: r.w, angle: r.angle + Math.PI / 2 }));
-      const hr = [];
-      for (const half of halves) hr.push(await recognizeCard(index, [rectify(frame, half)], { allowFlip: true, readText: false }));
-      if (hr.every((x) => x.cands.length && x.d <= 0.25)) { out.push(...hr); continue; }
+  const found = [];
+  const tryRect = async (rect, opts) => {
+    if (found.some((f) => sameSpot(f.rect, rect))) return null;
+    const res = await recognizeCard(index, [rectify(frame, rect)], { allowFlip: true, readText: false, ...opts });
+    if (!res.cands.length || res.d > MATCH_OK) return null;
+    const hit = { ...res, rect };
+    found.push(hit);
+    return hit;
+  };
+  const tick = async (i, n) => { onProgress?.(i, n); await new Promise((r) => setTimeout(r)); }; // let the status line repaint
+  const med = (a) => a.slice().sort((p, q) => p - q)[a.length >> 1];
+
+  // 1. Shapes that already look like single cards.
+  const singles = detectCards(frame);
+  for (let i = 0; i < singles.length; i++) { await tick(i + 1, singles.length); await tryRect(singles[i]); }
+
+  // 2. Blocks of cards that touch each other: cut into a grid and keep the cut whose pieces are recognised.
+  const sized = found.length ? found.map((f) => f.rect) : singles;
+  const card = sized.length ? { w: med(sized.map((r) => r.w)), h: med(sized.map((r) => r.h)) } : null;
+  const groups = detectGroups(frame, card, found.map((f) => f.rect)).sort((p, q) => p.w * p.h - q.w * q.h);
+  for (let g = 0; g < groups.length && g < 6; g++) {
+    await tick(g + 1, groups.length);
+    for (const cells of gridSplits(groups[g], card)) {
+      let hits = 0;
+      for (const cell of cells) if (await tryRect(cell)) hits++;
+      if (hits >= Math.max(1, cells.length / 2)) break;
     }
-    if (res.cands.length && res.d <= 0.30) out.push(res);
   }
-  return out;
+
+  // 3. Binder pages and neat rows: cards sit on a regular grid, so look where each found card's neighbours
+  //    should be. This picks up dark or shiny cards whose outline blends into the pocket.
+  if (found.length) {
+    const rects = found.map((f) => f.rect);
+    const cw = med(rects.map((r) => r.w)), ch = med(rects.map((r) => r.h));
+    // Average direction of the cards' short side (angles are only known up to a half turn, hence the doubling).
+    const ang = Math.atan2(rects.reduce((s, r) => s + Math.sin(2 * r.angle), 0), rects.reduce((s, r) => s + Math.cos(2 * r.angle), 0)) / 2;
+    const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    // Spacing between neighbours, measured from pairs already found in the same row or column.
+    const pxs = [], pys = [];
+    for (let a = 0; a < rects.length; a++) for (let b = a + 1; b < rects.length; b++) {
+      const dx = rects[b].cx - rects[a].cx, dy = rects[b].cy - rects[a].cy;
+      const du = Math.abs(dx * ux + dy * uy), dv = Math.abs(dx * vx + dy * vy);
+      if (dv < 0.35 * ch && du > 0.8 * cw) { const n = Math.round(du / (1.07 * cw)); if (n >= 1) pxs.push(du / n); }
+      if (du < 0.35 * cw && dv > 0.8 * ch) { const n = Math.round(dv / (1.05 * ch)); if (n >= 1) pys.push(dv / n); }
+    }
+    const px = Math.min(1.3 * cw, Math.max(cw, pxs.length ? med(pxs) : 1.07 * cw));
+    const py = Math.min(1.25 * ch, Math.max(ch, pys.length ? med(pys) : 1.05 * ch));
+    const flip = found.filter((f) => f.flip).length > found.length / 2;
+    const probed = [];
+    const queue = found.slice();
+    let budget = 28;
+    while (queue.length && budget > 0) {
+      const f = queue.shift();
+      for (const [i, j] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const rect = { cx: f.rect.cx + i * px * ux + j * py * vx, cy: f.rect.cy + i * px * uy + j * py * vy, w: cw, h: ch, angle: ang };
+        if (rect.cx < cw * 0.45 || rect.cy < ch * 0.45 || rect.cx > frame.width - cw * 0.45 || rect.cy > frame.height - ch * 0.45) continue;
+        if (found.some((o) => sameSpot(o.rect, rect)) || probed.some((o) => sameSpot(o, rect))) continue;
+        probed.push(rect);
+        if (--budget < 0) break;
+        await tick(found.length, found.length);
+        const hit = await tryRect(rect, { wide: true, flip });
+        if (hit) queue.push(hit);
+      }
+    }
+  }
+  return readingOrder(found.map((f) => f.rect)).map((r) => found.find((f) => f.rect === r));
 }
 
 /* ---------- sealed product from its picture ---------- */

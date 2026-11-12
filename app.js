@@ -94,7 +94,7 @@ function setStatus(msg, { busy = false, error = false } = {}) {
 }
 function idleStatus() {
   if (!state.stream) return setStatus('');
-  setStatus({ multi: 'Lay cards on a plain surface with gaps, then Scan all.', sealed: 'Fill the view with the front of the box or pack.' }[state.mode] || 'Fit the whole card inside the frame.');
+  setStatus({ multi: 'Get all the cards in view (table or binder page), then Scan all.', sealed: 'Fill the view with the front of the box or pack.' }[state.mode] || 'Fit the whole card inside the frame.');
 }
 
 const imgUrl = (base, q = 'high') => (base ? `${base}/${q}.webp` : '');
@@ -719,7 +719,7 @@ async function scan(frame, { guide = null } = {}) {
     const results = await recognizePhoto(index, frame);
     if (!results.length) {
       if (ai) return await scanWithAI(frame, true);
-      setStatus('No cards found. Lay them on a plain surface with a little space between each, then try again.', { error: true });
+      setStatus('No cards recognized. Move closer so the cards are bigger, cut the glare, and try again. English cards only.', { error: true });
       return;
     }
     countScan();
