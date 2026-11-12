@@ -30,6 +30,7 @@
   --gold: #F6CD68;
   --mint: #52D6A4;
   --warn: #F0B44A;
+  --slab: #B9A2FF;
   --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
   --font-body: "Figtree", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
@@ -179,6 +180,14 @@ button { cursor: pointer; }
 .printing[aria-pressed="true"]::before { content: "✓"; font-weight: 800; color: var(--accent); }
 .printings.need .label { color: var(--accent); }
 
+.cond { display: grid; gap: 8px; }
+.cond .label { font: 700 .7rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.cond-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.cond-row .printing { min-height: 42px; padding: 0 12px; }
+.cond-row .printing.grade { min-width: 46px; justify-content: center; padding: 0 8px; font-family: var(--font-mono); }
+.cond-row.need .printing { border-color: var(--slab); }
+.graded { color: var(--slab); font-weight: 700; }
+.price .links { margin-top: 8px; }
 .price { display: grid; gap: 2px; }
 .price-label { font: 600 .72rem/1.2 var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .price-main { font: 700 2.1rem/1.1 var(--font-mono); color: var(--gold); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
@@ -290,6 +299,8 @@ dialog .row .btn { min-height: 44px; }
   transition: transform .14s linear, width .14s linear, height .14s linear; will-change: transform;
 }
 .live-card.unsure { border-color: var(--warn); }
+.live-card.slab { border-color: var(--slab); border-style: double; border-width: 4px; }
+.live-card.slab .live-tag b { color: var(--slab); }
 .live-card.done { border-color: rgba(82, 214, 164, .45); }
 .live-tag {
   display: grid; justify-items: center; gap: 1px; max-width: 118%; margin-bottom: 6%; padding: 4px 8px; border-radius: 9px;
@@ -476,6 +487,13 @@ dialog input[type=text] { width: 100%; min-height: 46px; padding: 0 12px; border
       </div>
       <p class="dialog-err" id="settingsErr" hidden></p>
     </fieldset>
+    <fieldset>
+      <legend>Graded prices</legend>
+      <p>The app spots graded slabs and reads the grade by itself. To show what that grade actually sells for, paste a free Pokemon Price Tracker key (pokemonpricetracker.com, about 50 graded lookups a day). Without one you get an eBay sold-listings link instead.</p>
+      <label class="field">Pokemon Price Tracker API key
+        <input id="pptKey" type="password" placeholder="optional" autocomplete="off" spellcheck="false">
+      </label>
+    </fieldset>
     <div class="row">
       <button class="btn" value="cancel" type="submit">Cancel</button>
       <button class="btn primary" value="save" type="submit">Save</button>
@@ -484,8 +502,8 @@ dialog input[type=text] { width: 100%; min-height: 46px; padding: 0 12px; border
 </dialog>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
-<script src="app.js?v=5"></script>
-<script src="vision.js?v=5"></script>
-<script src="live.js?v=5"></script>
+<script src="app.js?v=6"></script>
+<script src="vision.js?v=6"></script>
+<script src="live.js?v=6"></script>
 </body>
 </html>

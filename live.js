@@ -100,8 +100,15 @@ function gridGeometry(rects) {
 }
 
 /** Is there anything card-like at `rect`? Adds a track and returns it, or remembers the spot as empty. */
-async function liveIdentify(index, frame, rect, { wide = false, flip = null } = {}) {
+async function liveIdentify(index, frame, rect, { wide = false, flip = null, inner = false } = {}) {
   const now = performance.now();
+  if (isSlabShaped(rect) && !inner) {
+    // A graded slab: the card sits in the lower part of the case.
+    for (const cardRect of slabCardRects(rect)) {
+      const t = await liveIdentify(index, frame, cardRect, { wide: true, flip, inner: true });
+      if (t) { t.inSlab = true; t.slab = { graded: true, company: null, grade: null, sure: false }; return t; }
+    }
+  }
   const view = rectify(frame, rect);
   // Quick outs: a flat patch (table, empty pocket) is not a card.
   hashCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -129,6 +136,7 @@ async function liveIdentify(index, frame, rect, { wide = false, flip = null } = 
     key: ++live.seq, rect, flip: !!res.flip, idx: index.byId.get(top.id), id: top.id, name: top.name,
     cands: res.cands, confidence: res.confidence, sameArt: !!res.sameArt,
     seen: now, checked: now, miss: 0, usd: null, eur: null, priced: false, done: false, textTried: false,
+    born: now, slab: null, slabAt: 0, gradedUsd: null,
   };
   // A card that blinked out of view and straight back is the same card: keep its "added" tick.
   const back = live.recent.findIndex((r) => r.done && r.id === track.id && now - r.goneAt < 4000);
@@ -146,6 +154,27 @@ function livePrice(track) {
     Object.assign(track, { card, printing, usd: v.usd, eur: v.eur, priced: true });
     liveRender();
   }).catch(() => { setTimeout(() => { if (live.tracks.includes(track)) livePrice(track); }, 3000); }); // price service busy: try again shortly
+}
+
+/** Decide raw vs graded for a followed card, read the label if it's big enough, and fetch the graded price. */
+function liveSlabCheck(frame, track, now) {
+  track.slabAt = now;
+  // In a binder the "strip above the card" is the next card up, not a label.
+  const up = track.flip ? -1 : 1;
+  const cardAbove = live.tracks.some((o) => o !== track && Math.abs(o.rect.cx - track.rect.cx) < 0.5 * track.rect.w
+    && (track.rect.cy - o.rect.cy) * up > 0.5 * track.rect.h && (track.rect.cy - o.rect.cy) * up < 1.6 * track.rect.h);
+  if (cardAbove && !track.inSlab) { track.slab = { graded: false }; return; }
+  inspectSlab(frame, track.rect, track.flip, { outline: !!track.inSlab, lone: live.tracks.length <= 2 }).then((info) => {
+    if (!live.tracks.includes(track)) return;
+    // Keep what was already read if this look saw less.
+    if (track.slab?.graded && track.slab.grade != null && info.grade == null) return;
+    track.slab = info;
+    const gr = gradeFromSlab(info);
+    if (gr && gr.g != null && track.card && pptKey()) {
+      gradedPrice(track.card, gr).then((r) => { track.gradedUsd = r?.usd ?? null; liveRender(); }).catch(() => {});
+    }
+    liveRender();
+  }).catch(() => {});
 }
 
 /** One large card that has same-art reprints: read its collector number once to settle the printing. */
@@ -248,6 +277,13 @@ async function livePass() {
     live.tracks = live.tracks.filter((t) => !gone.includes(t));
   }
 
+  // Raw or graded? Checked once a card has been in view for a moment (so its neighbours are known), and
+  // again every couple of seconds while a slab's grade is still unread (the person may move closer).
+  for (const t of live.tracks) {
+    const due = !t.slabAt ? now - t.born > 350 : (t.slab?.graded && t.slab.grade == null && now - t.slabAt > 2000);
+    if (due) liveSlabCheck(frame, t, now);
+  }
+
   // One or two big cards with look-alike reprints: read the number to pick the printing.
   if (live.tracks.length <= 2) {
     for (const t of live.tracks) if (t.sameArt && t.confidence !== 'strong' && !t.textTried && t.rect.w >= MIN_TEXT_WIDTH) liveReadNumber(index, frame, t);
@@ -258,16 +294,21 @@ async function livePass() {
 
 /* ---------- price tags ---------- */
 
+const liveGraded = (t) => !!t.slab?.graded;
 const liveMoney = (t) => {
-  const v = source() === 'cm' ? t.eur : t.usd, sym = source() === 'cm' ? '€' : '$';
+  // A graded card is never shown at its raw price.
+  const graded = liveGraded(t);
+  const v = graded ? t.gradedUsd : source() === 'cm' ? t.eur : t.usd, sym = graded || source() !== 'cm' ? '$' : '€';
   if (v == null) return null;
   return sym + (v >= 100 ? Math.round(v).toLocaleString('en-US') : v.toFixed(2));
 };
 
 function liveTotals() {
   const open = live.tracks.filter((t) => !t.done);
-  const total = open.reduce((s, t) => s + ((source() === 'cm' ? t.eur : t.usd) ?? 0), 0);
-  return { open, total, text: (source() === 'cm' ? eur : usd)(total) };
+  const total = open.reduce((s, t) => s + ((liveGraded(t) ? t.gradedUsd : source() === 'cm' ? t.eur : t.usd) ?? 0), 0);
+  // Graded cards with no graded price loaded are counted but add nothing to the total.
+  const unpriced = open.filter((t) => liveGraded(t) && t.gradedUsd == null).length;
+  return { open, total, unpriced, text: (source() === 'cm' ? eur : usd)(total) };
 }
 
 function liveRender() {
@@ -303,16 +344,21 @@ function liveRender() {
     el.classList.toggle('unsure', unsure && !t.done);
     el.classList.toggle('done', t.done);
     el.classList.toggle('small', w < 96);
-    el.querySelector('b').textContent = t.done ? '✓ ' + (price || 'added') : !t.priced ? '…' : (price || 'no price') + (unsure ? ' ?' : '');
-    el.querySelector('small').textContent = t.name;
-    el.setAttribute('aria-label', `${t.name}, ${price || 'price not available'}${unsure ? ', printing not certain' : ''}. Open details.`);
+    const graded = liveGraded(t), grade = graded ? gradeText(gradeFromSlab(t.slab)) : '';
+    el.classList.toggle('slab', graded && !t.done);
+    el.querySelector('b').textContent = t.done ? '✓ ' + (price || (graded ? grade : 'added'))
+      : graded ? (price || (t.slab.grade != null ? grade : 'Graded'))
+      : !t.priced ? '…' : (price || 'no price') + (unsure ? ' ?' : '');
+    el.querySelector('small').textContent = graded && price ? `${grade} · ${t.name}` : t.name;
+    el.setAttribute('aria-label', `${t.name}, ${graded ? 'graded ' + grade + ', ' : ''}${price || 'price not available'}${unsure ? ', printing not certain' : ''}. Open details.`);
   }
   for (const el of have.values()) el.remove();
 
   // Status line and main button follow what is in view.
   if (show && !state.busy) {
-    const { open, text } = liveTotals();
-    if (tracks.length) setStatus(open.length ? `${open.length} card${open.length === 1 ? '' : 's'} in view · ${text}` : 'All added. Move on to the next cards.');
+    const { open, text, total, unpriced } = liveTotals();
+    const bits = [`${open.length} card${open.length === 1 ? '' : 's'} in view`, total > 0 || !unpriced ? text : '', unpriced ? `${unpriced} graded` : ''].filter(Boolean);
+    if (tracks.length) setStatus(open.length ? bits.join(' · ') : 'All added. Move on to the next cards.');
     else setStatus('Point at your cards. Prices appear on them.');
   }
   renderDock();
@@ -328,7 +374,7 @@ async function liveOpen(key) {
   state.candidates = t.cands;
   state.confidence = t.confidence === 'strong' ? 'strong' : 'guess';
   try {
-    await openCard(t.id);
+    await openCard(t.id, { slab: t.slab });
     if (state.confidence === 'guess' && t.cands.length > 1) openCardChooser(true);
   } catch (e) { setStatus(e.message, { error: true }); }
 }
@@ -338,7 +384,7 @@ function liveReview() {
   const { open } = liveTotals();
   if (!open.length) return;
   live.reviewing = open;
-  showBatch(open.map((t) => ({ kind: 'card', label: t.name, query: '', cands: t.cands, sure: t.confidence === 'strong' })));
+  showBatch(open.map((t) => ({ kind: 'card', label: t.name, query: '', cands: t.cands, sure: t.confidence === 'strong', slab: t.slab })));
 }
 
 /** Called after cards were added to the binder, so their tags turn into ticks instead of being offered again. */

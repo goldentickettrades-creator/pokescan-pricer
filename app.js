@@ -19,7 +19,7 @@ const els = {
   batchPanel: $('#batchPanel'), batchTitle: $('#batchTitle'), batchNote: $('#batchNote'), batchList: $('#batchList'), batchAdd: $('#batchAdd'), batchRescan: $('#batchRescan'),
   binderPanel: $('#binderPanel'), binderBody: $('#binderBody'),
   lightbox: $('#lightbox'), lightboxImg: $('#lightboxImg'),
-  settings: $('#settings'), settingsBtn: $('#settingsBtn'), apiKey: $('#apiKey'), openaiKey: $('#openaiKey'), openaiModel: $('#openaiModel'),
+  settings: $('#settings'), settingsBtn: $('#settingsBtn'), apiKey: $('#apiKey'), openaiKey: $('#openaiKey'), openaiModel: $('#openaiModel'), pptKey: $('#pptKey'),
   soundOpt: $('#soundOpt'), settingsErr: $('#settingsErr'),
 };
 
@@ -31,6 +31,8 @@ const state = {
   card: null,            // full TCGdex card on the sheet
   sealed: null,          // sealed product on the sheet
   printing: null,        // chosen printing key, or null when the person still has to choose
+  grade: null,           // null = raw; { co, g } = graded (g null until the grade is chosen)
+  graded: { status: 'idle', usd: null, count: null, error: '' },   // graded price for the card on the sheet
   candidates: [],
   confidence: null,      // 'strong' | 'guess' | 'picked' | 'demo'
   detailsOpen: false,
@@ -599,6 +601,129 @@ async function findSealed({ name = '', set = '', type = '' }) {
 
 const sealedConfidence = (c) => (c.length && ((c[0].exact && !c[1]?.exact) || (c[0].score >= 0.85 && (!c[1] || c[0].score - c[1].score >= 0.08))) ? 'strong' : 'guess');
 
+/* ---------- graded cards ---------- */
+/*
+ * A grade is { co: 'PSA' | 'CGC' | 'BGS' | 'SGC' | 'TAG', g: 10 | 9.5 | ... | null }. g is null while the person
+ * still has to say which grade. Raw (ungraded) is `null`.
+ * Graded prices come from Pokemon Price Tracker (recent eBay and Fanatics sales per grade). It needs a free
+ * account key, pasted once in Settings; the free plan covers about 50 graded lookups a day, so answers are
+ * kept for a day per card.
+ */
+
+const GRADE_COMPANIES = ['PSA', 'CGC', 'BGS', 'SGC', 'TAG'];
+const GRADE_STEPS = [10, 9.5, 9, 8.5, 8, 7, 6, 5, 4, 3, 2, 1];
+const pptKey = () => storageGet('pokescan.pptKey', '');
+const gradeText = (gr) => (gr ? `${gr.co}${gr.g != null ? ' ' + gr.g : ''}` : '');
+const gradeKey = (gr) => gr.co.toLowerCase() + String(gr.g).replace('.', '_');
+const tcgplayerIdOf = (card) => { const tp = card?.pricing?.tcgplayer; return tp ? Object.values(tp).find((x) => x && x.productId)?.productId ?? null : null; };
+
+const gradedMem = new Map();
+/** Recent graded sale prices for a card, keyed like psa10 / cgc9_5: { price, count }. Null when there's no key or no TCGplayer id. */
+async function getGradedSales(card) {
+  const pid = tcgplayerIdOf(card);
+  if (!pid || !pptKey()) return null;
+  if (gradedMem.has(pid)) return gradedMem.get(pid);
+  const cached = storageGet('pokescan.graded.' + pid, null);
+  if (cached && Date.now() - cached.at < 24 * 3600e3) { gradedMem.set(pid, cached.sales); return cached.sales; }
+  const p = (async () => {
+    const res = await fetch(`https://www.pokemonpricetracker.com/api/v2/cards?tcgPlayerId=${encodeURIComponent(pid)}&includeEbay=true`, { headers: { authorization: 'Bearer ' + pptKey() } });
+    if (res.status === 401 || res.status === 403) throw new Error('Your Pokemon Price Tracker key was rejected. Check it in Settings.');
+    if (res.status === 429) throw new Error("Today's free graded-price lookups are used up. They reset tomorrow.");
+    if (!res.ok) throw new Error(`Graded prices are unavailable right now (${res.status}).`);
+    const j = await res.json();
+    const hit = Array.isArray(j.data) ? j.data[0] : j.data;
+    const sales = {};
+    for (const [k, v] of Object.entries(hit?.ebay?.salesByGrade || {})) {
+      const price = v?.smartMarketPrice?.price ?? v?.marketPrice7Day ?? v?.medianPrice ?? v?.averagePrice;
+      if (price != null) sales[k.toLowerCase()] = { price: Number(price), count: v?.count ?? null };
+    }
+    storageSet('pokescan.graded.' + pid, { at: Date.now(), sales });
+    return sales;
+  })();
+  p.catch(() => gradedMem.delete(pid));
+  gradedMem.set(pid, p);
+  return p;
+}
+
+/** The graded price for one grade of a card: { usd, count } (usd null when there were no recent sales). */
+async function gradedPrice(card, gr) {
+  if (!gr || gr.g == null) return null;
+  const sales = await getGradedSales(card);
+  if (!sales) return null;
+  const s = sales[gradeKey(gr)];
+  return { usd: s ? s.price : null, count: s ? s.count : 0 };
+}
+
+/** Load the graded price for the card on the sheet and redraw when it arrives. */
+function loadSheetGrade() {
+  const card = state.card, gr = state.grade;
+  state.graded = { status: 'idle', usd: null, count: null, error: '' };
+  if (!card || !gr || gr.g == null || !pptKey()) return;
+  state.graded.status = 'loading';
+  gradedPrice(card, gr).then((r) => {
+    if (state.card !== card || state.grade !== gr) return;
+    state.graded = { status: 'ok', usd: r?.usd ?? null, count: r?.count ?? 0, error: '' };
+    renderSheet(); renderDock();
+  }).catch((e) => {
+    if (state.card !== card || state.grade !== gr) return;
+    state.graded = { status: 'error', usd: null, count: null, error: e.message };
+    renderSheet();
+  });
+}
+
+function setSheetGrade(gr) {
+  state.grade = gr;
+  loadSheetGrade();
+  renderSheet();
+  renderDock();
+}
+
+const ebaySoldLink = (card, gr) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(`${gr ? gradeText(gr) + ' ' : ''}${card.name} ${numberText(card)} ${card.set?.name || ''}`.trim())}&LH_Sold=1&LH_Complete=1`;
+
+/** The "Raw / Graded" picker shown on a card's result. */
+function conditionHtml() {
+  const gr = state.grade;
+  return `
+    <div class="cond" role="group" aria-label="Condition">
+      <span class="label">${gr && gr.g == null ? 'Choose the grade' : 'Condition'}${gr?.seen ? ' · slab detected' : ''}</span>
+      <div class="cond-row">
+        <button type="button" class="printing" data-cond="raw" aria-pressed="${!gr}">Raw</button>
+        ${GRADE_COMPANIES.map((co) => `<button type="button" class="printing" data-co="${co}" aria-pressed="${gr?.co === co}">${co}</button>`).join('')}
+      </div>
+      ${gr ? `<div class="cond-row grades${gr.g == null ? ' need' : ''}">
+        ${GRADE_STEPS.map((g) => `<button type="button" class="printing grade" data-g="${g}" aria-pressed="${gr.g === g}">${g}</button>`).join('')}
+      </div>` : ''}
+    </div>`;
+}
+
+/** The price block for a graded card. The raw price is shown only as a reference, never as the value. */
+function gradedPriceHtml(card, rawUsd) {
+  const gr = state.grade, g = state.graded;
+  const ref = rawUsd != null ? `<span class="price-note">For reference, raw near-mint: ${usd(rawUsd)}</span>` : '';
+  const ebay = `<a class="btn" href="${esc(ebaySoldLink(card, gr))}" target="_blank" rel="noopener">eBay sold: ${esc(gradeText(gr))}</a>`;
+  if (gr.g == null) return `<span class="price-label">Graded ${esc(gr.co)}</span><span class="price-main none">Pick the grade above</span>${ref}`;
+  if (!pptKey()) {
+    return `<span class="price-label">${esc(gradeText(gr))} · graded</span>
+      <span class="price-main none">Graded price not loaded</span>
+      <span class="price-note">Graded cards sell for different amounts than raw ones. Add a free Pokemon Price Tracker key in Settings to see recent ${esc(gradeText(gr))} sales here, or check eBay.</span>
+      <div class="links">${ebay}<button class="btn" type="button" id="gradedKeyBtn">Add free key</button></div>${ref}`;
+  }
+  if (g.status === 'loading') return `<span class="price-label">${esc(gradeText(gr))} · recent sales</span><span class="price-main none">Loading…</span>${ref}`;
+  if (g.status === 'error') return `<span class="price-label">${esc(gradeText(gr))} · recent sales</span><span class="price-main none">${esc(g.error)}</span><div class="links">${ebay}</div>${ref}`;
+  if (g.usd == null) return `<span class="price-label">${esc(gradeText(gr))} · recent sales</span><span class="price-main none">No recent ${esc(gradeText(gr))} sales</span><div class="links">${ebay}</div>${ref}`;
+  return `<span class="price-label">${esc(gradeText(gr))} · recent eBay sales · USD</span>
+    <span class="price-main">${usd(g.usd)}</span>
+    <span class="price-note">${g.count ? `Based on ${g.count} sale${g.count === 1 ? '' : 's'}` : 'Estimated from recent sales'} · Pokemon Price Tracker</span>
+    <div class="links">${ebay}</div>${ref}`;
+}
+
+function wireCondition() {
+  els.sheetBody.querySelectorAll('[data-cond="raw"]').forEach((b) => b.addEventListener('click', () => setSheetGrade(null)));
+  els.sheetBody.querySelectorAll('[data-co]').forEach((b) => b.addEventListener('click', () => setSheetGrade({ co: b.dataset.co, g: state.grade?.g ?? null })));
+  els.sheetBody.querySelectorAll('[data-g]').forEach((b) => b.addEventListener('click', () => setSheetGrade({ co: state.grade.co, g: parseFloat(b.dataset.g) })));
+  $('#gradedKeyBtn')?.addEventListener('click', openSettings);
+}
+
 /* ---------- pricing (cards) ---------- */
 
 const PRINTING_ORDER = ['normal', 'holofoil', 'reverse-holofoil', '1st-edition-holofoil', '1st-edition-normal', 'unlimited-holofoil', 'unlimited'];
@@ -722,7 +847,7 @@ async function scan(frame, { guide = null } = {}) {
       if (results[0].confidence !== 'strong' && ai) { try { return await scanWithAI(frame, true); } catch { /* keep the on-device answer */ } }
       return await showCardResult(results[0], false);
     }
-    await showBatch(results.map((r) => ({ kind: 'card', label: r.cands[0]?.name || 'Unreadable card', query: '', cands: r.cands, sure: r.confidence === 'strong' })));
+    await showBatch(results.map((r) => ({ kind: 'card', label: r.cands[0]?.name || 'Unreadable card', query: '', cands: r.cands, sure: r.confidence === 'strong', slab: r.slab || null })));
   } catch (e) {
     setStatus(e.message || 'Something went wrong. Try again.', { error: true });
   } finally {
@@ -737,7 +862,7 @@ async function showCardResult(res, count = true) {
   state.candidates = res.cands;
   state.confidence = res.confidence;
   setStatus('Getting prices…', { busy: true });
-  await openCard(res.cands[0].id);
+  await openCard(res.cands[0].id, { slab: res.slab || null });
   idleStatus();
   if (state.confidence === 'guess') openCardChooser(true);
 }
@@ -854,7 +979,7 @@ function renderMode() {
 
 /* ---------- result sheet ---------- */
 
-async function openCard(id, { demo = false } = {}) {
+async function openCard(id, { demo = false, slab = null } = {}) {
   const card = await getCard(id);
   state.card = card;
   state.sealed = null;
@@ -863,6 +988,8 @@ async function openCard(id, { demo = false } = {}) {
   state.printing = printings.length === 1 ? printings[0] : null;
   state.detailsOpen = false;
   if (demo) state.confidence = 'demo';
+  state.grade = gradeFromSlab(slab);
+  loadSheetGrade();
   renderSheet();
   showSheet();
 }
@@ -936,7 +1063,7 @@ function renderSheet() {
   const rev = state.printing === 'reverse-holofoil';
   const productId = v?.productId || (tp && Object.values(tp).find((x) => x && x.productId)?.productId);
   const tcgLink = productId ? `https://www.tcgplayer.com/product/${productId}` : `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(c.name + ' ' + (c.set?.name || ''))}`;
-  const ebayLink = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(`${c.name} ${numberText(c)} ${c.set?.name || ''}`.trim())}&LH_Sold=1&LH_Complete=1`;
+  const ebayLink = ebaySoldLink(c, null);
   const multiple = state.candidates.length > 1 && state.confidence !== 'demo';
 
   els.sheetBody.innerHTML = `
@@ -957,12 +1084,15 @@ function renderSheet() {
       ${printings.map((p) => `<button type="button" class="printing" data-p="${esc(p)}" aria-pressed="${p === state.printing}">${esc(printingLabel(p))}</button>`).join('')}
     </div>` : ''}
 
+    ${state.confidence !== 'demo' ? conditionHtml() : ''}
+
+    ${state.grade ? `<div class="price">${gradedPriceHtml(c, valuesFor(c, state.printing || printings[0]).usd)}</div>` : `
     <div class="price">
       ${priceHtml}
       <span class="price-note">Near-mint, ungraded${updatedText ? ` · Updated ${esc(updatedText)}` : ''}</span>
-    </div>
+    </div>`}
 
-    <button class="row-btn" type="button" id="detailsBtn" aria-expanded="${state.detailsOpen}" aria-controls="details">Price details ${chevron('M6 9l6 6 6-6')}</button>
+    <button class="row-btn" type="button" id="detailsBtn" aria-expanded="${state.detailsOpen}" aria-controls="details">${state.grade ? 'Raw card prices' : 'Price details'} ${chevron('M6 9l6 6 6-6')}</button>
     <div class="details" id="details" ${state.detailsOpen ? '' : 'hidden'}>
       <div class="price-table">
         <h3><span>TCGplayer${state.printing ? ' · ' + esc(printingLabel(state.printing)) : ''}</span><span>USD</span></h3>
@@ -995,6 +1125,7 @@ function renderSheet() {
   $('#detailsBtn').addEventListener('click', () => { state.detailsOpen = !state.detailsOpen; renderSheet(); });
   $('#wrongBtn')?.addEventListener('click', () => openCardChooser(false));
   $('#thumbBtn').addEventListener('click', () => c.image && openLightbox(imgUrl(c.image, 'high'), c.name));
+  wireCondition();
 }
 
 let sealedUpdated = null;
@@ -1058,15 +1189,16 @@ function renderDock() {
   els.dockResult.hidden = !showResult;
   if (showResult) {
     const needPrinting = !!state.card && printingsOf(state.card).length > 1 && !state.printing;
-    els.addBtn.disabled = state.saving || needPrinting || state.confidence === 'demo';
-    els.addBtn.textContent = state.confidence === 'demo' ? 'Demo card' : needPrinting ? 'Choose printing' : 'Add & next';
+    const needGrade = !!state.card && !!state.grade && state.grade.g == null;
+    els.addBtn.disabled = state.saving || needPrinting || needGrade || state.confidence === 'demo';
+    els.addBtn.textContent = state.confidence === 'demo' ? 'Demo card' : needPrinting ? 'Choose printing' : needGrade ? 'Choose grade' : 'Add & next';
     els.skipBtn.textContent = state.confidence === 'demo' ? 'Close' : 'Skip';
   } else {
     if (state.mode === 'live' && state.stream && !state.busy) {
       // Live: nothing to press to scan. The button collects whatever is in view.
-      const { open, text } = liveTotals();
+      const { open, text, total, unpriced } = liveTotals();
       els.scanBtn.disabled = !open.length;
-      els.scanBtn.textContent = open.length ? `Add ${open.length} · ${text}` : live.tracks.length ? 'All added' : 'Looking for cards…';
+      els.scanBtn.textContent = open.length ? `Add ${open.length}${total > 0 || !unpriced ? ' · ' + text : ''}` : live.tracks.length ? 'All added' : 'Looking for cards…';
       return;
     }
     els.scanBtn.disabled = state.busy;
@@ -1195,9 +1327,12 @@ async function showBatch(entries) {
       else if (e.cands.length) {
         b.card = await getCard(e.cands[0].id);
         b.printing = printingsOf(b.card)[0] || null;
+        b.grade = gradeFromSlab(e.slab);
+        if (b.grade) { try { b.gradedUsd = (await gradedPrice(b.card, b.grade))?.usd ?? null; } catch { b.gradedUsd = null; } }
       }
     } catch { /* leave unmatched */ }
-    b.include = !!(b.card || b.product);
+    // A slab whose grade couldn't be read is left unticked: open it to set the grade.
+    b.include = !!(b.card || b.product) && !(b.grade && b.grade.g == null);
     return b;
   }));
   state.batch = batch;
@@ -1206,7 +1341,7 @@ async function showBatch(entries) {
   idleStatus();
 }
 
-const batchValue = (b) => (b.product ? b.product.market : b.card ? valuesFor(b.card, b.printing).usd : null);
+const batchValue = (b) => (b.product ? b.product.market : !b.card ? null : b.grade ? b.gradedUsd ?? null : valuesFor(b.card, b.printing).usd);
 
 function renderBatch() {
   const b = state.batch;
@@ -1227,7 +1362,7 @@ function renderBatch() {
     if (x.product) sub = `<span class="s">Sealed · ${esc(x.product.group.replace(/^[A-Z0-9]+:\s*/, ''))}</span>`;
     else if (x.card) {
       const pr = printingsOf(x.card);
-      sub = `<span class="s">${x.sure ? '' : '<b class="miss">Check · </b>'}${esc(x.card.set?.name || '')} · #${esc(numberText(x.card))}</span>` +
+      sub = `<span class="s">${x.grade ? `<b class="graded">${esc(gradeText(x.grade))}${x.grade.g == null ? ' · tap to set grade' : ''} · </b>` : ''}${x.sure ? '' : '<b class="miss">Check · </b>'}${esc(x.card.set?.name || '')} · #${esc(numberText(x.card))}</span>` +
         (pr.length > 1 ? `<select data-i="${i}" aria-label="Printing for ${esc(x.card.name)}">${pr.map((p) => `<option value="${esc(p)}"${p === x.printing ? ' selected' : ''}>${esc(printingLabel(p))}</option>`).join('')}</select>` : '');
     } else sub = `<span class="miss">No match${x.query ? ` for “${esc(x.label)}”` : ''}. Tap to search.</span>`;
     const val = batchValue(x);
@@ -1235,7 +1370,7 @@ function renderBatch() {
       <button type="button" class="check" role="checkbox" aria-checked="${x.include}" data-act="toggle" data-i="${i}" ${ok ? '' : 'disabled'} aria-label="Include ${esc((x.card || x.product)?.name || x.label)}"><span></span></button>
       <span data-act="fix" data-i="${i}" style="cursor:pointer">${img}</span>
       <span class="t" data-act="fix" data-i="${i}" style="cursor:pointer"><span class="n">${esc((x.card || x.product)?.name || x.label || 'Unknown item')}</span>${sub}</span>
-      <span class="v"><span class="usd mono">${ok ? (val != null ? usd(val) : 'No price') : ''}</span></span>
+      <span class="v"><span class="usd mono">${ok ? (val != null ? usd(val) : x.grade ? 'Graded' : 'No price') : ''}</span></span>
     </div>`;
   }).join('');
   els.batchAdd.disabled = !chosen.length;
@@ -1249,6 +1384,13 @@ els.batchList.addEventListener('click', (ev) => {
   if (!x) return;
   if (t.dataset.act === 'toggle') { x.include = !x.include; renderBatch(); return; }
   // Fix the match: pick from the alternatives, or search when nothing matched.
+  if (x.card && x.grade && x.grade.g == null) {
+    // A slab with an unread grade: open the card so the grade can be picked, then add it from there.
+    closePanel(els.batchPanel);
+    state.candidates = x.cands; state.confidence = x.sure ? 'strong' : 'guess';
+    openCard(x.card.id, { slab: x.slab }).catch((e) => setStatus(e.message, { error: true }));
+    return;
+  }
   if (!x.cands.length) {
     closePanel(els.batchPanel);
     openSearch(x.kind === 'sealed' ? 'sealed' : 'card', x.query);
@@ -1279,7 +1421,7 @@ els.batchList.addEventListener('change', (ev) => {
 function addBatch() {
   const chosen = state.batch.filter((x) => x.include && (x.card || x.product));
   if (!chosen.length) return;
-  const adds = chosen.map((x) => (x.product ? addSealedEntry(x.product) : addCardEntry(x.card, x.printing)));
+  const adds = chosen.map((x) => (x.product ? addSealedEntry(x.product) : addCardEntry(x.card, x.printing, x.grade, x.gradedUsd ?? null)));
   saveCollection();
   const total = chosen.reduce((s, x) => s + (batchValue(x) ?? 0), 0);
   const anyNew = adds.some((a) => a.isNew);
@@ -1291,18 +1433,20 @@ function addBatch() {
 
 /* ---------- binder ---------- */
 
-function entryKey(e) { return e.id + '|' + (e.printing || ''); }
+function entryKey(e) { return e.id + '|' + (e.printing || '') + (e.grade ? '|' + e.grade : ''); }
 
-function addCardEntry(c, printing) {
+/** grade: null for a raw card, or { co, g } with gradedUsd its graded price (null when unknown). A graded copy never takes the raw price. */
+function addCardEntry(c, printing, grade = null, gradedUsd = null) {
   const isNew = !inBinder(c.id);
-  const vals = valuesFor(c, printing);
-  const key = c.id + '|' + (printing || '');
+  const gradeStr = grade ? gradeText(grade) : '';
+  const vals = grade ? { usd: gradedUsd, eur: null } : valuesFor(c, printing);
+  const key = c.id + '|' + (printing || '') + (gradeStr ? '|' + gradeStr : '');
   let entry = state.collection.find((e) => entryKey(e) === key);
   const created = !entry;
   if (entry) { entry.qty += 1; entry.usd = vals.usd; entry.eur = vals.eur; }
   else {
     entry = { kind: 'card', id: c.id, name: c.name, set: c.set?.name || '', localId: c.localId, number: numberText(c), image: c.image || '',
-      thumb: imgUrl(c.image, 'low'), printing, usd: vals.usd, eur: vals.eur, qty: 1, added: Date.now() };
+      thumb: imgUrl(c.image, 'low'), printing, grade: gradeStr, usd: vals.usd, eur: vals.eur, qty: 1, added: Date.now() };
     state.collection.unshift(entry);
   }
   return { key, created, isNew, entry };
@@ -1377,9 +1521,10 @@ function addAndNext() {
   const c = state.card, p = state.sealed;
   if (!c && !p) return;
   if (c && printingsOf(c).length > 1 && !state.printing) return;
+  if (c && state.grade && state.grade.g == null) return;
   state.saving = true;
   renderDock();
-  const add = c ? addCardEntry(c, state.printing) : addSealedEntry(p);
+  const add = c ? addCardEntry(c, state.printing, state.grade, state.graded.usd) : addSealedEntry(p);
   saveCollection();
   flyToStrip(els.sheetBody.querySelector('.thumb img'));
   celebrate(`${add.isNew ? 'New find · ' : ''}Added · ${add.entry.name} ×${add.entry.qty}`, add.isNew, [add]);
@@ -1433,7 +1578,7 @@ function renderBinder() {
           <img loading="lazy" ${e.kind === 'sealed' ? 'class="sealed-img"' : ''} src="${esc(thumbOf(e))}" alt="">
           <span class="t">
             <span class="n">${esc(e.name)}</span>
-            <span class="s">${e.kind === 'sealed' ? 'Sealed · ' + esc(e.set) : `${e.printing ? esc(printingLabel(e.printing)) + ' · ' : ''}${esc(e.set)} #${esc(e.number || e.localId)}`}</span>
+            <span class="s">${e.kind === 'sealed' ? 'Sealed · ' + esc(e.set) : `${e.grade ? `<b class="graded">${esc(e.grade)}</b> · ` : ''}${e.printing ? esc(printingLabel(e.printing)) + ' · ' : ''}${esc(e.set)} #${esc(e.number || e.localId)}`}</span>
             <span class="qty">
               <button type="button" data-act="dec" data-i="${i}" aria-label="${e.qty > 1 ? 'One fewer' : 'Remove'} ${esc(e.name)}">${e.qty > 1 ? '−' : '×'}</button>
               <span>${e.qty}</span>
@@ -1441,7 +1586,7 @@ function renderBinder() {
             </span>
           </span>
           <span class="v">
-            <span class="usd mono">${cm ? (e.eur != null ? eur(e.eur * e.qty) : 'No price') : (e.usd != null ? usd(e.usd * e.qty) : 'No price')}</span>
+            <span class="usd mono">${cm && !e.grade ? (e.eur != null ? eur(e.eur * e.qty) : 'No price') : (e.usd != null ? usd(e.usd * e.qty) : e.grade ? 'Graded' : 'No price')}</span>
             <span class="eur mono">${cm ? (e.usd != null ? usd(e.usd * e.qty) : '') : (e.eur != null ? eur(e.eur * e.qty) : '')}</span>
           </span>
         </div>`).join('')}
@@ -1489,8 +1634,14 @@ async function refreshPrices(btn) {
         if (p) e.usd = p.market; else failed++;
       } else {
         const card = await getJSON(`${API}/cards/${encodeURIComponent(e.id)}`);
-        const vals = valuesFor(card, e.printing || printingsOf(card)[0]);
-        e.usd = vals.usd; e.eur = vals.eur;
+        if (e.grade) {
+          // Graded copies keep their graded price; refresh it only when a graded-price key is set.
+          const [co, g] = e.grade.split(' ');
+          if (pptKey() && g) e.usd = (await gradedPrice(card, { co, g: parseFloat(g) }))?.usd ?? e.usd;
+        } else {
+          const vals = valuesFor(card, e.printing || printingsOf(card)[0]);
+          e.usd = vals.usd; e.eur = vals.eur;
+        }
       }
     } catch { failed++; }
   }
@@ -1501,9 +1652,9 @@ async function refreshPrices(btn) {
 }
 
 function exportCsv() {
-  const rows = [['Type', 'Name', 'Set', 'Number', 'Printing', 'Qty', 'TCGplayer market (USD)', 'Cardmarket trend (EUR)', 'Total USD', 'Total EUR', 'ID']];
+  const rows = [['Type', 'Name', 'Set', 'Number', 'Printing', 'Grade', 'Qty', 'TCGplayer market (USD)', 'Cardmarket trend (EUR)', 'Total USD', 'Total EUR', 'ID']];
   for (const e of state.collection) {
-    rows.push([e.kind === 'sealed' ? 'Sealed' : 'Card', e.name, e.set, e.number || e.localId || '', e.printing ? printingLabel(e.printing) : '', e.qty, e.usd ?? '', e.eur ?? '',
+    rows.push([e.kind === 'sealed' ? 'Sealed' : 'Card', e.name, e.set, e.number || e.localId || '', e.printing ? printingLabel(e.printing) : '', e.grade || (e.kind === 'sealed' ? '' : 'Raw'), e.qty, e.usd ?? '', e.eur ?? '',
       e.usd != null ? (e.usd * e.qty).toFixed(2) : '', e.eur != null ? (e.eur * e.qty).toFixed(2) : '', e.id]);
   }
   const csv = rows.map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\r\n');
@@ -1520,6 +1671,7 @@ function openSettings() {
   els.apiKey.value = claudeKey();
   els.openaiKey.value = openaiKey();
   els.openaiModel.value = storageGet('pokescan.openaiModel', '');
+  els.pptKey.value = pptKey();
   els.soundOpt.checked = soundOn();
   const prov = storageGet('pokescan.provider', null) || (claudeKey() ? 'claude' : openaiKey() ? 'openai' : 'ocr');
   els.settings.querySelectorAll('input[name=provider]').forEach((r) => { r.checked = r.value === prov; });
@@ -1552,6 +1704,7 @@ els.settings.addEventListener('close', () => {
   storageSet('pokescan.apiKey', els.apiKey.value.trim());
   storageSet('pokescan.openaiKey', els.openaiKey.value.trim());
   storageSet('pokescan.openaiModel', els.openaiModel.value.trim());
+  if (els.pptKey.value.trim() !== pptKey()) { storageSet('pokescan.pptKey', els.pptKey.value.trim()); gradedMem.clear(); loadSheetGrade(); }
   storageSet('pokescan.sound', els.soundOpt.checked);
   const prov = els.settings.querySelector('input[name=provider]:checked');
   if (prov) storageSet('pokescan.provider', prov.value);

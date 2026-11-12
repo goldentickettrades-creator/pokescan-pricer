@@ -13,6 +13,15 @@ On a phone, add it to your home screen (Share → Add to Home Screen on iPhone, 
 - **Search** – type a card ("Charizard 4/102") or a sealed product ("151 ETB").
 - **Binder** – a running list of what you've added, with totals, Undo, and CSV export. Saved in your browser on that device.
 
+## Raw vs graded
+
+The app tells a bare card from one in a graded slab, and never prices a slab as if it were raw.
+
+- It recognizes a slab by its outline (a case is narrower for its height than a card), by a PSA-style label above the card, or by reading the label. When the slab is large in view it reads the company and grade ("PSA 10", "CGC 9.5").
+- On a card's result you can always switch between **Raw** and a company and grade yourself.
+- Graded prices (recent eBay sales for that exact grade) come from [Pokemon Price Tracker](https://www.pokemonpricetracker.com). Paste a free key in **Settings → Graded prices**; the free plan covers about 50 graded lookups a day. Without a key the app shows the grade and a one-tap eBay sold-listings link for it instead of a price.
+- Graded copies are saved in the binder with their grade, separate from raw copies.
+
 ## How it recognizes things
 
 Everything runs on your phone, free, with no account or API key:

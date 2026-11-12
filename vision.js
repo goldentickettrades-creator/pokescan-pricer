@@ -363,7 +363,8 @@ function readingOrder(rects) {
 function detectCards(src, { modes = ['ring', 'bright'], ...opts } = {}) {
   const out = [];
   for (const mode of modes) {
-    for (const r of detectBlobs(src, { ...opts, mode })) if (isCardShaped(r) && !out.some((o) => sameSpot(o, r))) out.push(r);
+    // Card-shaped, or slab-shaped (a graded card's case is narrower for its height than a bare card).
+    for (const r of detectBlobs(src, { ...opts, mode })) if ((isCardShaped(r) || (r.fit >= 0.75 && isSlabShaped(r))) && !out.some((o) => sameSpot(o, r))) out.push(r);
   }
   return readingOrder(out);
 }
@@ -549,8 +550,16 @@ const MATCH_OK = 0.26; // a found shape counts as a card only if some card's pic
 async function recognizeMany(index, frame, onProgress) {
   const found = [];
   const tryRect = async (rect, opts) => {
+    if (isSlabShaped(rect) && !opts?.inner) {
+      // A graded slab: the card sits in the lower part of the case.
+      for (const inner of slabCardRects(rect)) {
+        const hit = await tryRect(inner, { ...opts, wide: true, inner: true });
+        if (hit) { hit.inSlab = true; return hit; }
+      }
+    }
     if (found.some((f) => sameSpot(f.rect, rect))) return null;
-    const res = await recognizeCard(index, [rectify(frame, rect)], { allowFlip: true, readText: false, ...opts });
+    const { inner, ...ropts } = opts || {};
+    const res = await recognizeCard(index, [rectify(frame, rect)], { allowFlip: true, readText: false, ...ropts });
     if (!res.cands.length || res.d > MATCH_OK) return null;
     const hit = { ...res, rect };
     found.push(hit);
@@ -612,6 +621,8 @@ async function recognizeMany(index, frame, onProgress) {
       }
     }
   }
+  // Raw or graded? Look at what surrounds each card (and read the label when it's big enough).
+  for (const f of found) f.slab = await inspectSlab(frame, f.rect, f.flip, { outline: !!f.inSlab, lone: found.length <= 2 });
   return readingOrder(found.map((f) => f.rect)).map((r) => found.find((f) => f.rect === r));
 }
 
@@ -727,3 +738,133 @@ const sealedPictureConfidence = (c) => (c.length && c[0].d <= 0.2 && (!c[1] || c
 // Fetch the picture indexes in the background so the first scan doesn't wait for them.
 getIndex().catch(() => {});
 getSealedPics().catch(() => {});
+
+/* ---------- graded slabs ---------- */
+/*
+ * A graded card sits in a hard plastic case ("slab") with the grading company's label above it.
+ * Three clues, any of which marks a card as graded:
+ *   - the outline around it is slab-shaped (about 0.60 wide:tall; a bare card is 0.72) with the card in the lower part;
+ *   - the strip above the card looks like a PSA label (white, wider than the card, with red on it);
+ *   - the text read off that strip names a grading company or a grade ("GEM MT 10", "CGC", "PRISTINE"...).
+ * Reading the text needs the slab to be large in view; the first two work at any size.
+ */
+
+const SLAB_ASPECT_MAX = 0.66;
+const isSlabShaped = (r) => r.w / r.h >= 0.52 && r.w / r.h <= SLAB_ASPECT_MAX;
+
+/** Where the card would sit inside a slab-shaped outline: lower part of the case, label at either end. */
+function slabCardRects(r) {
+  const cw = r.w * 0.764, ch = cw / CARD_ASPECT;
+  const vx = -Math.sin(r.angle), vy = Math.cos(r.angle), off = r.h * 0.085;
+  return [1, -1].map((s) => ({ cx: r.cx + s * off * vx, cy: r.cy + s * off * vy, w: cw, h: ch, angle: r.angle }));
+}
+
+/** The card and its surroundings as an upright picture: 200px-wide card with room above it for a label. */
+const SLAB_U = 200, SLAB_SIDE = 50, SLAB_TOP = 140, SLAB_BOTTOM = 42;
+function slabContext(frame, rect, flip, scale = 1) {
+  const cw = SLAB_U * scale, ch = cw * (rect.h / rect.w);
+  const c = document.createElement('canvas');
+  c.width = Math.round(cw + 2 * SLAB_SIDE * scale); c.height = Math.round(ch + (SLAB_TOP + SLAB_BOTTOM) * scale);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.translate(c.width / 2, SLAB_TOP * scale + ch / 2);
+  ctx.rotate(-rect.angle + (flip ? Math.PI : 0));
+  ctx.scale(cw / rect.w, cw / rect.w);
+  ctx.translate(-rect.cx, -rect.cy);
+  ctx.drawImage(frame, 0, 0);
+  return { canvas: c, cardX: SLAB_SIDE * scale, cardY: SLAB_TOP * scale, cardW: cw, cardH: ch, scale };
+}
+
+/** Does the strip above the card look like a PSA label? Cheap colour test, usable at any size. */
+function looksLikePsaLabel(frame, rect, flip) {
+  const cx = slabContext(frame, rect, flip);
+  const y0 = Math.round(cx.cardY - 0.36 * cx.cardH), y1 = Math.round(cx.cardY - 0.06 * cx.cardH);
+  const x0 = Math.round(cx.cardX - 0.15 * cx.cardW), x1 = Math.round(cx.cardX + 1.15 * cx.cardW);
+  const d = cx.canvas.getContext('2d').getImageData(x0, y0, x1 - x0, y1 - y0).data;
+  const w = x1 - x0, sideW = Math.round(0.15 * cx.cardW);
+  let mid = 0, midWhite = 0, side = 0, sideWhite = 0, red = 0, n = 0;
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), sat = mx ? (mx - mn) / mx : 0;
+    const white = mx >= 0.6 && sat <= 0.3;
+    const x = p % w;
+    if (x < sideW || x >= w - sideW) { side++; if (white) sideWhite++; } else { mid++; if (white) midWhite++; }
+    if (sat >= 0.5 && mx >= 0.35 && r === mx && g < 0.45 * mx + 0.1 && b < 0.5 * mx + 0.1) red++;
+    n++;
+  }
+  const stats = { white: midWhite / mid, sideWhite: sideWhite / side, red: red / n };
+  // White across the card's width AND beyond its edges (a label is wider than the card), with some red on it.
+  return { ...stats, psa: stats.white >= 0.45 && stats.sideWhite >= 0.35 && stats.red >= 0.015 && stats.red <= 0.5 };
+}
+
+/** Pull the grading company and grade out of whatever text was read off a label. */
+function parseSlabText(text) {
+  const T = ' ' + String(text).toUpperCase().replace(/[|]/g, 'I').replace(/\s+/g, ' ') + ' ';
+  let company = null;
+  if (/\bPSA\b/.test(T)) company = 'PSA';
+  else if (/\bCGC\b/.test(T)) company = 'CGC';
+  else if (/BECKETT|\bBGS\b/.test(T)) company = 'BGS';
+  else if (/\bSGC\b/.test(T)) company = 'SGC';
+  else if (/\bTAG\b/.test(T)) company = 'TAG';
+  // Grade wording, most specific first. "EX" alone is skipped: it is part of card names.
+  const WORDS = [
+    [/GEM\s*-?\s*M(?:IN)?T/, 10, 'gem'], [/PRISTINE/, 10, 'pristine'], [/NM\s*[-/]?\s*M(?:IN)?T\s*\+/, 8.5], [/NM\s*[-/]?\s*M(?:IN)?T/, 8],
+    [/\bMINT\s*\+/, 9.5], [/\bMINT\b/, 9], [/\bNM\s*\+/, 7.5], [/NEAR\s*MINT|\bNM\b/, 7],
+    [/EX\s*[-/]?\s*M(?:IN)?T\s*\+/, 6.5], [/EX\s*[-/]?\s*M(?:IN)?T/, 6], [/VG\s*[-/]?\s*EX/, 4], [/\bGOOD\b/, 2], [/AUTHENTIC/, 0],
+  ];
+  let word = null;
+  for (const [re, g, tag] of WORDS) if (re.test(T)) { word = { g, tag }; break; }
+  // A grade printed as a number on its own: 10, 9.5, 9 ... 1.
+  const nums = [...T.matchAll(/(?<![\d#./-])(10|[1-9](?:\.5)?)(?![\d./-])/g)].map((m) => parseFloat(m[1]));
+  let grade = null, sure = false;
+  const close = word ? nums.filter((n) => n <= word.g && n >= word.g - 1) : [];
+  if (word && nums.includes(word.g) && company !== 'BGS') { grade = word.g; sure = true; }
+  else if (word && close.length) { grade = Math.max(...close); sure = true; }
+  else if (word) { grade = word.g; sure = word.tag === 'gem' || word.tag === 'pristine'; }
+  else if (company && nums.length === 1) grade = nums[0];
+  if (!company && word?.tag === 'gem' && /GEM\s*-?\s*MT\b/.test(T)) company = 'PSA'; // "GEM MT" is PSA's wording
+  if (grade === 0) grade = null; // "Authentic": in a slab but with no number grade
+  return { company, grade, sure, found: !!(company || word) };
+}
+
+/** Read the label above a card (needs the slab large in view). Returns parseSlabText's result plus the raw text. */
+async function readSlabLabel(frame, rect, flip) {
+  const scale = Math.max(1.5, Math.min(5, rect.w / SLAB_U));
+  const cx = slabContext(frame, rect, flip, scale);
+  const y0 = Math.max(0, Math.round(cx.cardY - 0.42 * cx.cardH)), y1 = Math.round(cx.cardY - 0.02 * cx.cardH);
+  const x0 = Math.max(0, Math.round(cx.cardX - 0.2 * cx.cardW)), x1 = Math.min(cx.canvas.width, Math.round(cx.cardX + 1.2 * cx.cardW));
+  const label = document.createElement('canvas');
+  label.width = x1 - x0; label.height = y1 - y0;
+  label.getContext('2d').drawImage(cx.canvas, x0, y0, label.width, label.height, 0, 0, label.width, label.height);
+  const worker = await getWorker();
+  const { data } = await worker.recognize(band(label, 0, 1, 0, 1, Math.max(900, Math.min(1500, label.width * 2))));
+  return { ...parseSlabText(data.text || ''), text: (data.text || '').trim() };
+}
+
+const SLAB_READ_MIN = 280; // card width in pixels below which label text is too small to read
+
+/**
+ * Raw or graded? Returns { graded, company, grade, sure }.
+ *  outline: the card was found inside a slab-shaped outline; lone: it is one of at most two cards in view,
+ *  so it is worth reading the strip above it even with no other sign of a slab.
+ */
+async function inspectSlab(frame, rect, flip, { outline = false, lone = false } = {}) {
+  const look = looksLikePsaLabel(frame, rect, flip);
+  const info = { graded: outline || look.psa, company: look.psa ? 'PSA' : null, grade: null, sure: false };
+  if (rect.w >= SLAB_READ_MIN && (info.graded || lone)) {
+    try {
+      const lab = await readSlabLabel(frame, rect, flip);
+      // With no other sign of a slab, only believe the text if it gives both a company and a grade.
+      if (info.graded ? lab.found : lab.company && lab.grade != null) {
+        return { graded: true, company: lab.company || info.company, grade: lab.grade, sure: lab.sure };
+      }
+    } catch { /* keep what the picture says */ }
+  }
+  return info;
+}
+
+/** Turn what the scan saw into the app's grade: null for raw, or { co, g, seen } with g null when the grade wasn't read. */
+function gradeFromSlab(slab) {
+  if (!slab?.graded) return null;
+  return { co: slab.company || 'PSA', g: slab.grade ?? null, seen: true };
+}
